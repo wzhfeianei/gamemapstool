@@ -10,6 +10,7 @@
 #include <vector>
 #include <chrono>
 
+#include <dwmapi.h>
 #include <d3d11.h>
 #include <dxgi1_2.h>
 #include <objbase.h>
@@ -806,12 +807,51 @@ bool CaptureWindowToPngBytesWgc(HWND hwnd, std::vector<uint8_t>* output,
   }
   D3D11_TEXTURE2D_DESC desc;
   texture->GetDesc(&desc);
-  desc.BindFlags = 0;
-  desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-  desc.Usage = D3D11_USAGE_STAGING;
-  desc.MiscFlags = 0;
+
+  // Calculate crop
+  UINT client_width = desc.Width;
+  UINT client_height = desc.Height;
+  UINT offset_x = 0;
+  UINT offset_y = 0;
+
+  if (IsWindow(hwnd)) {
+       RECT client_rect;
+       if (GetClientRect(hwnd, &client_rect)) {
+           POINT pt = {0, 0};
+           ClientToScreen(hwnd, &pt);
+           
+           RECT window_rect;
+           if (DwmGetWindowAttribute(hwnd, DWMWA_EXTENDED_FRAME_BOUNDS, &window_rect, sizeof(window_rect)) != S_OK) {
+               GetWindowRect(hwnd, &window_rect);
+           }
+           
+           int off_x = pt.x - window_rect.left;
+           int off_y = pt.y - window_rect.top;
+           int c_w = client_rect.right - client_rect.left;
+           int c_h = client_rect.bottom - client_rect.top;
+           
+           if (off_x < 0) off_x = 0;
+           if (off_y < 0) off_y = 0;
+           if (off_x + c_w > (int)desc.Width) c_w = desc.Width - off_x;
+           if (off_y + c_h > (int)desc.Height) c_h = desc.Height - off_y;
+
+           client_width = (UINT)c_w;
+           client_height = (UINT)c_h;
+           offset_x = (UINT)off_x;
+           offset_y = (UINT)off_y;
+       }
+  }
+
+  D3D11_TEXTURE2D_DESC staging_desc = desc;
+  staging_desc.Width = client_width;
+  staging_desc.Height = client_height;
+  staging_desc.BindFlags = 0;
+  staging_desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+  staging_desc.Usage = D3D11_USAGE_STAGING;
+  staging_desc.MiscFlags = 0;
+
   ComPtr<ID3D11Texture2D> staging;
-  hr = d3d_device->CreateTexture2D(&desc, nullptr, &staging);
+  hr = d3d_device->CreateTexture2D(&staging_desc, nullptr, &staging);
   if (FAILED(hr)) {
     if (error) {
       *error = L"Failed to create staging texture";
@@ -821,7 +861,16 @@ bool CaptureWindowToPngBytesWgc(HWND hwnd, std::vector<uint8_t>* output,
     }
     return false;
   }
-  d3d_context->CopyResource(staging.Get(), texture.get());
+  
+  D3D11_BOX src_box;
+  src_box.left = offset_x;
+  src_box.top = offset_y;
+  src_box.front = 0;
+  src_box.right = offset_x + client_width;
+  src_box.bottom = offset_y + client_height;
+  src_box.back = 1;
+  d3d_context->CopySubresourceRegion(staging.Get(), 0, 0, 0, 0, texture.get(), 0, &src_box);
+
   D3D11_MAPPED_SUBRESOURCE mapped;
   hr = d3d_context->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &mapped);
   if (FAILED(hr)) {
@@ -834,7 +883,7 @@ bool CaptureWindowToPngBytesWgc(HWND hwnd, std::vector<uint8_t>* output,
     return false;
   }
   const uint64_t buffer_size =
-      static_cast<uint64_t>(mapped.RowPitch) * desc.Height;
+      static_cast<uint64_t>(mapped.RowPitch) * staging_desc.Height;
   if (buffer_size == 0 || buffer_size > static_cast<uint64_t>(UINT_MAX)) {
     d3d_context->Unmap(staging.Get(), 0);
     if (error) {
@@ -864,7 +913,7 @@ bool CaptureWindowToPngBytesWgc(HWND hwnd, std::vector<uint8_t>* output,
   }
   ComPtr<IWICBitmap> wic_bitmap;
   hr = factory->CreateBitmapFromMemory(
-      desc.Width, desc.Height, GUID_WICPixelFormat32bppBGRA,
+      staging_desc.Width, staging_desc.Height, GUID_WICPixelFormat32bppBGRA,
       mapped.RowPitch, static_cast<UINT>(buffer_size),
       static_cast<BYTE*>(mapped.pData), &wic_bitmap);
   d3d_context->Unmap(staging.Get(), 0);
@@ -933,10 +982,10 @@ bool CaptureWindowToPngBytes(HWND hwnd, std::vector<uint8_t>* output,
   HGDIOBJ old_object = SelectObject(hdc_mem, bitmap);
   // Manual capture: Prefer PrintWindow as it handles most windows better (including partially obscured ones)
   // Fallback to BitBlt if PrintWindow fails, then to WGC.
-  BOOL ok = PrintWindow(hwnd, hdc_mem, 0x00000002); // PW_CLIENTONLY | PW_RENDERFULLCONTENT
+  BOOL ok = PrintWindow(hwnd, hdc_mem, 0x00000003); // PW_CLIENTONLY | PW_RENDERFULLCONTENT
   if (!ok) {
       // Try standard PrintWindow
-      ok = PrintWindow(hwnd, hdc_mem, 0);
+      ok = PrintWindow(hwnd, hdc_mem, 0x00000001); // PW_CLIENTONLY
   }
   if (!ok) {
       // Try BitBlt as last resort for GDI
@@ -998,7 +1047,7 @@ bool CaptureWindowToPngBytesPrintWindow(HWND hwnd, std::vector<uint8_t>* output,
     return false;
   }
   HGDIOBJ old_object = SelectObject(hdc_mem, bitmap);
-  BOOL ok = PrintWindow(hwnd, hdc_mem, 0x00000002);
+  BOOL ok = PrintWindow(hwnd, hdc_mem, 0x00000003); // PW_CLIENTONLY | PW_RENDERFULLCONTENT
   if (!ok) {
     SelectObject(hdc_mem, old_object);
     ReleaseDC(hwnd, hdc_window);
@@ -1228,6 +1277,7 @@ FlutterWindow::MessageHandler(HWND hwnd, UINT const message,
       flutter_controller_->engine()->ReloadSystemFonts();
       break;
     case WM_CAPTURE_COMPLETE:
+      start_task_running_ = false;
       if (pending_start_result_) {
         if (wparam == 1) { // Success
           pending_start_result_->Success();
@@ -1384,6 +1434,12 @@ void FlutterWindow::StartCaptureSession(
       capture_mode = std::get<std::string>(mode_it->second);
   }
   
+  if (start_task_running_) {
+    result->Error("busy", "Capture session is starting");
+    return;
+  }
+  start_task_running_ = true;
+
   // Store the result to be completed later
   pending_start_result_ = std::move(result);
   pending_start_error_.clear();
@@ -1465,6 +1521,7 @@ void FlutterWindow::StartCaptureSession(
 
           frame_arrived_token_ = frame_pool_.FrameArrived({this, &FlutterWindow::OnFrameArrived});
 
+          current_capture_hwnd_ = hwnd;
           session_.StartCapture();
           {
               std::lock_guard<std::mutex> lock(frame_mutex_);
@@ -1496,6 +1553,7 @@ void FlutterWindow::StopCaptureSession(std::unique_ptr<flutter::MethodResult<flu
   {
     std::lock_guard<std::mutex> lock(frame_mutex_);
     is_capturing_ = false;
+    current_capture_hwnd_ = nullptr;
     if (session_) {
       session_.Close();
       session_ = nullptr;
@@ -1689,14 +1747,50 @@ void FlutterWindow::OnFrameArrived(
         D3D11_TEXTURE2D_DESC desc;
         texture->GetDesc(&desc);
         
+        // Calculate Crop Region
+        UINT client_width = desc.Width;
+        UINT client_height = desc.Height;
+        UINT offset_x = 0;
+        UINT offset_y = 0;
+
+        if (current_capture_hwnd_ && IsWindow(current_capture_hwnd_)) {
+             RECT client_rect;
+             if (GetClientRect(current_capture_hwnd_, &client_rect)) {
+                 POINT pt = {0, 0};
+                 ClientToScreen(current_capture_hwnd_, &pt);
+                 
+                 RECT window_rect;
+                 if (DwmGetWindowAttribute(current_capture_hwnd_, DWMWA_EXTENDED_FRAME_BOUNDS, &window_rect, sizeof(window_rect)) != S_OK) {
+                     GetWindowRect(current_capture_hwnd_, &window_rect);
+                 }
+                 
+                 int off_x = pt.x - window_rect.left;
+                 int off_y = pt.y - window_rect.top;
+                 int c_w = client_rect.right - client_rect.left;
+                 int c_h = client_rect.bottom - client_rect.top;
+                 
+                 if (off_x < 0) off_x = 0;
+                 if (off_y < 0) off_y = 0;
+                 if (off_x + c_w > (int)desc.Width) c_w = desc.Width - off_x;
+                 if (off_y + c_h > (int)desc.Height) c_h = desc.Height - off_y;
+
+                 client_width = (UINT)c_w;
+                 client_height = (UINT)c_h;
+                 offset_x = (UINT)off_x;
+                 offset_y = (UINT)off_y;
+             }
+        }
+
         // 3. Check/Update staging texture (protected by lock)
         if (!staging_texture_ || 
-            staging_desc_.Width != desc.Width || 
-            staging_desc_.Height != desc.Height ||
+            staging_desc_.Width != client_width || 
+            staging_desc_.Height != client_height ||
             staging_desc_.Format != desc.Format) {
             
             staging_texture_ = nullptr;
             D3D11_TEXTURE2D_DESC new_desc = desc;
+            new_desc.Width = client_width;
+            new_desc.Height = client_height;
             new_desc.BindFlags = 0;
             new_desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
             new_desc.Usage = D3D11_USAGE_STAGING;
@@ -1715,14 +1809,23 @@ void FlutterWindow::OnFrameArrived(
         lock.unlock();
 
         // 6. Perform heavy operations (GPU Copy, Map, Memcpy)
-        local_context->CopyResource(local_staging.Get(), texture.Get());
+        // Use CopySubresourceRegion to crop
+        D3D11_BOX src_box;
+        src_box.left = offset_x;
+        src_box.top = offset_y;
+        src_box.front = 0;
+        src_box.right = offset_x + client_width;
+        src_box.bottom = offset_y + client_height;
+        src_box.back = 1;
+        
+        local_context->CopySubresourceRegion(local_staging.Get(), 0, 0, 0, 0, texture.Get(), 0, &src_box);
         
         D3D11_MAPPED_SUBRESOURCE mapped;
         hr = local_context->Map(local_staging.Get(), 0, D3D11_MAP_READ, 0, &mapped);
         if (FAILED(hr)) return;
         
         if (capture_texture_) {
-            capture_texture_->UpdateFrame((uint8_t*)mapped.pData, desc.Width, desc.Height, mapped.RowPitch);
+            capture_texture_->UpdateFrame((uint8_t*)mapped.pData, client_width, client_height, mapped.RowPitch);
         }
         
         local_context->Unmap(local_staging.Get(), 0);
