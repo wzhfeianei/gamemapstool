@@ -43,7 +43,6 @@ class _CapturePageState extends State<CapturePage> {
   List<ProcessEntry> _processList = [];
   ProcessEntry? _selectedProcess;
   bool _processLoading = false;
-  bool _isBusy = false; // Prevents re-entry during async ops
   int _imageVersion = 0;
   final List<Map<String, String>> _captureModes = [
     <String, String>{'value': 'bitblt', 'label': 'BitBlt'},
@@ -233,7 +232,7 @@ class _CapturePageState extends State<CapturePage> {
   }
 
   Future<void> _startAutoCapture() async {
-    if (_autoEnabled || _isBusy) {
+    if (_autoEnabled) {
       return;
     }
     final ProcessEntry? process = _selectedProcess;
@@ -245,7 +244,7 @@ class _CapturePageState extends State<CapturePage> {
     }
 
     setState(() {
-      _isBusy = true;
+      _autoEnabled = true;
       _errorMessage = null;
     });
 
@@ -254,11 +253,6 @@ class _CapturePageState extends State<CapturePage> {
         'pid': process.pid,
         'processName': process.name,
         'mode': _selectedCaptureMode,
-      });
-
-      if (!mounted) return;
-      setState(() {
-        _autoEnabled = true;
       });
 
       // Try to get texture ID for all modes as they all support it now
@@ -282,7 +276,6 @@ class _CapturePageState extends State<CapturePage> {
         // Fallback to manual loop if texture is not available
       }
 
-      // Start the loop without awaiting it, as it runs indefinitely until stopped
       _captureLoop();
     } on PlatformException catch (e) {
       if (!mounted) return;
@@ -290,12 +283,6 @@ class _CapturePageState extends State<CapturePage> {
         _autoEnabled = false;
         _errorMessage = e.message ?? '启动捕获会话失败';
       });
-    } finally {
-      if (mounted) {
-        setState(() {
-          _isBusy = false;
-        });
-      }
     }
   }
 
@@ -333,39 +320,30 @@ class _CapturePageState extends State<CapturePage> {
   }
 
   Future<void> _stopAutoCapture() async {
-    if (_isBusy) return;
-    setState(() {
-      _isBusy = true;
-    });
-
     try {
-      // Try to get one last frame before stopping
       if (_textureId != null) {
-        try {
-          final Uint8List? lastFrame = await _channel.invokeMethod(
-            'getLastFrame',
-          );
-          if (lastFrame != null && mounted) {
-            setState(() {
-              _imageBytes = lastFrame;
-            });
-          }
-        } catch (e) {
-          // Ignore last frame error
+        final Uint8List? lastFrame = await _channel.invokeMethod(
+          'getLastFrame',
+        );
+        if (lastFrame != null && mounted) {
+          setState(() {
+            _imageBytes = lastFrame;
+          });
         }
       }
+    } catch (e) {
+      debugPrint('Get last frame error: $e');
+    }
 
+    if (!mounted) return;
+    setState(() {
+      _autoEnabled = false;
+      _textureId = null;
+    });
+    try {
       await _channel.invokeMethod('stopCaptureSession');
     } catch (e) {
       debugPrint('Stop capture session error: $e');
-    } finally {
-      if (mounted) {
-        setState(() {
-          _autoEnabled = false;
-          _textureId = null;
-          _isBusy = false;
-        });
-      }
     }
   }
 
@@ -549,19 +527,10 @@ class _CapturePageState extends State<CapturePage> {
                 ),
                 const SizedBox(width: 12),
                 FilledButton(
-                  onPressed: _isBusy
-                      ? null
-                      : (_autoEnabled ? _stopAutoCapture : _startAutoCapture),
-                  child: _isBusy
-                      ? const SizedBox(
-                          width: 20,
-                          height: 20,
-                          child: CircularProgressIndicator(
-                            strokeWidth: 2,
-                            color: Colors.white,
-                          ),
-                        )
-                      : Text(_autoEnabled ? '停止实时捕获' : '开始实时捕获'),
+                  onPressed: _autoEnabled
+                      ? _stopAutoCapture
+                      : _startAutoCapture,
+                  child: Text(_autoEnabled ? '停止实时捕获' : '开始实时捕获'),
                 ),
               ],
             ),
