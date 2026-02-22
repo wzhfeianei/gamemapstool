@@ -4,12 +4,16 @@
 #include <flutter/dart_project.h>
 #include <flutter/flutter_view_controller.h>
 #include <flutter/method_channel.h>
+#include <flutter/plugin_registrar_windows.h>
 #include <flutter/standard_method_codec.h>
+#include <flutter/texture_registrar.h>
 
 #include <memory>
 #include <map>
 #include <vector>
 #include <mutex>
+#include <atomic>
+#include <variant>
 
 #include "win32_window.h"
 
@@ -20,6 +24,32 @@
 
 // Custom message for capture completion
 #define WM_CAPTURE_COMPLETE (WM_USER + 101)
+
+class CaptureTexture {
+ public:
+  CaptureTexture(flutter::TextureRegistrar* texture_registrar);
+  ~CaptureTexture();
+
+  int64_t id() const { return texture_id_; }
+
+  void UpdateFrame(const uint8_t* data, size_t width, size_t height, size_t row_pitch);
+
+  const FlutterDesktopPixelBuffer* CopyPixelBuffer(size_t width, size_t height);
+
+  bool GetContent(std::vector<uint8_t>* output, size_t* width, size_t* height);
+  
+  void GetSize(size_t* width, size_t* height);
+
+ private:
+  flutter::TextureRegistrar* texture_registrar_;
+  std::unique_ptr<flutter::TextureVariant> texture_;
+  int64_t texture_id_ = -1;
+  std::mutex mutex_;
+  std::vector<uint8_t> buffer_;
+  size_t width_ = 0;
+  size_t height_ = 0;
+  std::unique_ptr<FlutterDesktopPixelBuffer> pixel_buffer_;
+};
 
 // A window that does nothing but host a Flutter view.
 class FlutterWindow : public Win32Window {
@@ -41,6 +71,7 @@ class FlutterWindow : public Win32Window {
 
   // The Flutter instance hosted by this window.
   std::unique_ptr<flutter::FlutterViewController> flutter_controller_;
+  std::unique_ptr<flutter::PluginRegistrarWindows> plugin_registrar_;
   std::unique_ptr<flutter::MethodChannel<flutter::EncodableValue>>
       capture_channel_;
 
@@ -69,9 +100,13 @@ class FlutterWindow : public Win32Window {
   void StartCaptureSession(const flutter::MethodCall<flutter::EncodableValue>& call,
                            std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> result);
   void StopCaptureSession(std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> result);
-  void GetCaptureFrame(std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> result);
+  void GetCaptureFrame(const flutter::MethodCall<flutter::EncodableValue>& call, std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> result);
+  void GetLastFrame(std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> result);
+  void GetTextureId(std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> result);
   void OnFrameArrived(winrt::Windows::Graphics::Capture::Direct3D11CaptureFramePool const& sender,
                       winrt::Windows::Foundation::IInspectable const& args);
+
+  std::unique_ptr<CaptureTexture> capture_texture_;
 };
 
 #endif  // RUNNER_FLUTTER_WINDOW_H_

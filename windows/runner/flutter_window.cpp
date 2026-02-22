@@ -1,4 +1,5 @@
 #include "flutter_window.h"
+#include "utils.h"
 
 #include <optional>
 #include <algorithm>
@@ -32,6 +33,73 @@ struct __declspec(uuid("A9B3D012-3DF2-4EE3-B8D1-8695F457D3C1"))
 #endif
 
 #include "flutter/generated_plugin_registrant.h"
+
+CaptureTexture::CaptureTexture(flutter::TextureRegistrar* texture_registrar)
+    : texture_registrar_(texture_registrar) {
+  texture_ = std::make_unique<flutter::TextureVariant>(
+      flutter::PixelBufferTexture([this](size_t width, size_t height) -> const FlutterDesktopPixelBuffer* {
+        return this->CopyPixelBuffer(width, height);
+      }));
+  texture_id_ = texture_registrar_->RegisterTexture(texture_.get());
+}
+
+CaptureTexture::~CaptureTexture() {
+  texture_registrar_->UnregisterTexture(texture_id_);
+}
+
+void CaptureTexture::UpdateFrame(const uint8_t* data, size_t width, size_t height, size_t row_pitch) {
+  const std::lock_guard<std::mutex> lock(mutex_);
+  
+  if (width_ != width || height_ != height) {
+    width_ = width;
+    height_ = height;
+    buffer_.resize(width * height * 4);
+    pixel_buffer_ = std::make_unique<FlutterDesktopPixelBuffer>();
+    pixel_buffer_->width = width;
+    pixel_buffer_->height = height;
+    pixel_buffer_->release_callback = nullptr;
+    pixel_buffer_->release_context = nullptr;
+  }
+
+  if (buffer_.size() != width * height * 4) return;
+
+  // Copy with stride handling. 
+  // Source is BGRA (from D3D11), Destination is BGRA (Flutter standard on Windows).
+  if (row_pitch == width * 4) {
+      memcpy(buffer_.data(), data, buffer_.size());
+  } else {
+      for (size_t y = 0; y < height; ++y) {
+          memcpy(buffer_.data() + y * width * 4, data + y * row_pitch, width * 4);
+      }
+  }
+
+  texture_registrar_->MarkTextureFrameAvailable(texture_id_);
+}
+
+const FlutterDesktopPixelBuffer* CaptureTexture::CopyPixelBuffer(size_t width, size_t height) {
+  const std::lock_guard<std::mutex> lock(mutex_);
+  if (buffer_.empty()) return nullptr;
+  
+  pixel_buffer_->buffer = buffer_.data();
+  pixel_buffer_->width = width_;
+  pixel_buffer_->height = height_;
+  return pixel_buffer_.get();
+}
+
+bool CaptureTexture::GetContent(std::vector<uint8_t>* output, size_t* width, size_t* height) {
+  const std::lock_guard<std::mutex> lock(mutex_);
+  if (buffer_.empty()) return false;
+  *output = buffer_;
+  *width = width_;
+  *height = height_;
+  return true;
+}
+
+void CaptureTexture::GetSize(size_t* width, size_t* height) {
+  const std::lock_guard<std::mutex> lock(mutex_);
+  *width = width_;
+  *height = height_;
+}
 
 namespace {
 using Microsoft::WRL::ComPtr;
@@ -930,6 +998,13 @@ bool FlutterWindow::OnCreate() {
     return false;
   }
   RegisterPlugins(flutter_controller_->engine());
+  
+  auto registrar_ref = flutter_controller_->engine()->GetRegistrarForPlugin("gamemapstool_internal");
+  plugin_registrar_ = std::make_unique<flutter::PluginRegistrarWindows>(registrar_ref);
+
+  capture_texture_ = std::make_unique<CaptureTexture>(
+      plugin_registrar_->texture_registrar());
+
   capture_channel_ = std::make_unique<
       flutter::MethodChannel<flutter::EncodableValue>>(
       flutter_controller_->engine()->messenger(), "gamemapstool/capture",
@@ -946,8 +1021,12 @@ bool FlutterWindow::OnCreate() {
           StopCaptureSession(std::move(result));
           return;
         }
+        if (call.method_name() == "getTextureId") {
+          GetTextureId(std::move(result));
+          return;
+        }
         if (call.method_name() == "getCaptureFrame") {
-          GetCaptureFrame(std::move(result));
+          GetCaptureFrame(call, std::move(result));
           return;
         }
         if (call.method_name() == "listProcesses") {
@@ -1245,17 +1324,152 @@ void FlutterWindow::StopCaptureSession(std::unique_ptr<flutter::MethodResult<flu
   }
 }
 
-void FlutterWindow::GetCaptureFrame(std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> result) {
-  std::vector<uint8_t> data;
-  {
-    std::lock_guard<std::mutex> lock(frame_mutex_);
-    data = last_frame_data_;
+void FlutterWindow::GetCaptureFrame(const flutter::MethodCall<flutter::EncodableValue>& call, std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> result) {
+  // 1. Try fast path if actively capturing
+  if (is_capturing_ && capture_texture_) {
+    std::vector<uint8_t> buffer;
+    size_t width, height;
+    if (capture_texture_->GetContent(&buffer, &width, &height)) {
+       HRESULT com_init = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+       ComPtr<IWICImagingFactory> factory;
+       HRESULT hr = CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&factory));
+       if (SUCCEEDED(hr)) {
+           ComPtr<IWICBitmap> wic_bitmap;
+           hr = factory->CreateBitmapFromMemory(
+               static_cast<UINT>(width), static_cast<UINT>(height),
+               GUID_WICPixelFormat32bppBGRA,
+               static_cast<UINT>(width * 4),
+               static_cast<UINT>(buffer.size()),
+               buffer.data(),
+               &wic_bitmap);
+           if (SUCCEEDED(hr)) {
+               std::vector<uint8_t> png_bytes;
+               std::wstring error;
+               if (EncodeWicBitmapToPng(factory.Get(), wic_bitmap.Get(), &png_bytes, &error)) {
+                   if (SUCCEEDED(com_init)) CoUninitialize();
+                   result->Success(flutter::EncodableValue(png_bytes));
+                   return;
+               }
+           }
+       }
+       if (SUCCEEDED(com_init)) CoUninitialize();
+    }
   }
-  if (data.empty()) {
-      result->Success(flutter::EncodableValue(std::vector<uint8_t>()));
+
+  // 2. Slow path (manual capture or fallback)
+  const auto* arguments = std::get_if<flutter::EncodableMap>(call.arguments());
+  if (!arguments) {
+      result->Error("invalid_arguments", "Arguments must be a map");
+      return;
+  }
+  
+  int64_t pid = 0;
+  auto pid_it = arguments->find(flutter::EncodableValue("pid"));
+  if (pid_it != arguments->end()) {
+      if (std::holds_alternative<int32_t>(pid_it->second))
+          pid = std::get<int32_t>(pid_it->second);
+      else if (std::holds_alternative<int64_t>(pid_it->second))
+          pid = std::get<int64_t>(pid_it->second);
+  }
+
+  if (pid <= 0) {
+      result->Error("invalid_pid", "PID must be positive");
+      return;
+  }
+
+  std::set<DWORD> pids;
+  pids.insert(static_cast<DWORD>(pid));
+  HWND hwnd = FindBestWindowForPids(pids);
+  
+  if (!hwnd) {
+      result->Error("window_not_found", "Could not find window for PID");
+      return;
+  }
+
+  std::vector<uint8_t> png_bytes;
+  std::wstring error;
+  // Try WGC capture first
+  if (CaptureWindowToPngBytesWgc(hwnd, &png_bytes, &error)) {
+      result->Success(flutter::EncodableValue(png_bytes));
+      return;
+  }
+  
+  // Try GDI capture as fallback
+  if (CaptureWindowToPngBytes(hwnd, &png_bytes, &error)) {
+      result->Success(flutter::EncodableValue(png_bytes));
+      return;
+  }
+
+  // Convert wstring error to string (basic conversion)
+  std::string error_str = Utf8FromUtf16(error.c_str());
+  result->Error("capture_failed", error_str.empty() ? "Failed to capture window" : error_str);
+}
+
+void FlutterWindow::GetTextureId(std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> result) {
+  if (capture_texture_) {
+    size_t width = 0;
+    size_t height = 0;
+    capture_texture_->GetSize(&width, &height);
+    
+    flutter::EncodableMap map;
+    map[flutter::EncodableValue("id")] = flutter::EncodableValue(capture_texture_->id());
+    map[flutter::EncodableValue("width")] = flutter::EncodableValue((int64_t)width);
+    map[flutter::EncodableValue("height")] = flutter::EncodableValue((int64_t)height);
+    
+    result->Success(flutter::EncodableValue(map));
   } else {
-      result->Success(flutter::EncodableValue(data));
+    result->Error("NO_TEXTURE", "Capture texture not initialized");
   }
+}
+
+void FlutterWindow::GetLastFrame(std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> result) {
+  if (!capture_texture_) {
+    result->Error("NO_TEXTURE", "Capture texture not initialized");
+    return;
+  }
+
+  std::vector<uint8_t> buffer;
+  size_t width, height;
+  if (!capture_texture_->GetContent(&buffer, &width, &height)) {
+    result->Error("NO_CONTENT", "No content in texture");
+    return;
+  }
+
+  HRESULT com_init = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+
+  ComPtr<IWICImagingFactory> factory;
+  HRESULT hr = CoCreateInstance(CLSID_WICImagingFactory, nullptr,
+                        CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&factory));
+  if (FAILED(hr)) {
+     if (SUCCEEDED(com_init)) CoUninitialize();
+     result->Error("WIC_ERROR", "Failed to create WIC factory");
+     return;
+  }
+
+  ComPtr<IWICBitmap> wic_bitmap;
+  hr = factory->CreateBitmapFromMemory(
+      static_cast<UINT>(width), static_cast<UINT>(height),
+      GUID_WICPixelFormat32bppBGRA,
+      static_cast<UINT>(width * 4),
+      static_cast<UINT>(buffer.size()),
+      buffer.data(),
+      &wic_bitmap);
+
+  if (FAILED(hr)) {
+     if (SUCCEEDED(com_init)) CoUninitialize();
+     result->Error("WIC_ERROR", "Failed to create bitmap from memory");
+     return;
+  }
+
+  std::vector<uint8_t> output;
+  std::wstring error;
+  if (EncodeWicBitmapToPng(factory.Get(), wic_bitmap.Get(), &output, &error)) {
+      result->Success(flutter::EncodableValue(output));
+  } else {
+      result->Error("ENCODE_ERROR", Utf8FromUtf16(error.c_str()));
+  }
+
+  if (SUCCEEDED(com_init)) CoUninitialize();
 }
 
 void FlutterWindow::OnFrameArrived(
@@ -1311,52 +1525,9 @@ void FlutterWindow::OnFrameArrived(
     hr = local_context->Map(local_staging.Get(), 0, D3D11_MAP_READ, 0, &mapped);
     if (FAILED(hr)) return;
     
-    int width = desc.Width;
-    int height = desc.Height;
-    int src_stride = mapped.RowPitch;
-    // 24-bit BMP stride must be a multiple of 4 bytes
-    int dst_stride = (width * 3 + 3) & ~3;
-    int data_size = dst_stride * height;
-    int file_size = 54 + data_size;
-    
-    std::vector<uint8_t> bmp(file_size);
-    
-    // BITMAPFILEHEADER
-    bmp[0] = 'B'; bmp[1] = 'M';
-    *(int32_t*)&bmp[2] = file_size;
-    *(int32_t*)&bmp[6] = 0;
-    *(int32_t*)&bmp[10] = 54;
-    
-    // BITMAPINFOHEADER
-    *(int32_t*)&bmp[14] = 40;
-    *(int32_t*)&bmp[18] = width;
-    *(int32_t*)&bmp[22] = -height; // Top-down
-    *(int16_t*)&bmp[26] = 1;
-    *(int16_t*)&bmp[28] = 24; // 24-bit BGR (no alpha)
-    *(int32_t*)&bmp[30] = 0; // BI_RGB
-    *(int32_t*)&bmp[34] = data_size;
-    *(int32_t*)&bmp[38] = 0;
-    *(int32_t*)&bmp[42] = 0;
-    *(int32_t*)&bmp[46] = 0;
-    *(int32_t*)&bmp[50] = 0;
-    
-    uint8_t* src_base = (uint8_t*)mapped.pData;
-    uint8_t* dst_base = &bmp[54];
-    
-    for (int y = 0; y < height; ++y) {
-        uint8_t* src_row = src_base + y * src_stride;
-        uint8_t* dst_row = dst_base + y * dst_stride;
-        for (int x = 0; x < width; ++x) {
-            // BGRA -> BGR
-            dst_row[x * 3 + 0] = src_row[x * 4 + 0]; // B
-            dst_row[x * 3 + 1] = src_row[x * 4 + 1]; // G
-            dst_row[x * 3 + 2] = src_row[x * 4 + 2]; // R
-        }
+    if (capture_texture_) {
+        capture_texture_->UpdateFrame((uint8_t*)mapped.pData, desc.Width, desc.Height, mapped.RowPitch);
     }
     
     local_context->Unmap(local_staging.Get(), 0);
-    
-    // 7. Re-acquire lock to update shared state
-    lock.lock();
-    last_frame_data_ = std::move(bmp);
 }

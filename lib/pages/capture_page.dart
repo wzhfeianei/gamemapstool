@@ -63,6 +63,9 @@ class _CapturePageState extends State<CapturePage> {
   int _rotationQuarterTurns = 0;
   bool _flipHorizontal = false;
   bool _grayscale = false;
+  int? _textureId;
+  double? _textureWidth;
+  double? _textureHeight;
 
   @override
   void initState() {
@@ -241,6 +244,24 @@ class _CapturePageState extends State<CapturePage> {
         'processName': process.name,
         'mode': _selectedCaptureMode,
       });
+
+      if (_selectedCaptureMode == 'wgc') {
+        final Map<Object?, Object?>? result = await _channel
+            .invokeMapMethod<Object?, Object?>('getTextureId');
+        if (result != null) {
+          final int? tid = result['id'] as int?;
+          final int? w = result['width'] as int?;
+          final int? h = result['height'] as int?;
+          if (tid != null) {
+            setState(() {
+              _textureId = tid;
+              _textureWidth = w?.toDouble();
+              _textureHeight = h?.toDouble();
+            });
+          }
+        }
+      }
+
       _captureLoop();
     } on PlatformException catch (e) {
       if (!mounted) return;
@@ -253,6 +274,7 @@ class _CapturePageState extends State<CapturePage> {
 
   Future<void> _captureLoop() async {
     if (!_autoEnabled) return;
+    if (_textureId != null) return;
 
     final Stopwatch stopwatch = Stopwatch()..start();
     try {
@@ -286,8 +308,25 @@ class _CapturePageState extends State<CapturePage> {
   }
 
   Future<void> _stopAutoCapture() async {
+    try {
+      if (_textureId != null) {
+        final Uint8List? lastFrame = await _channel.invokeMethod(
+          'getLastFrame',
+        );
+        if (lastFrame != null && mounted) {
+          setState(() {
+            _imageBytes = lastFrame;
+          });
+        }
+      }
+    } catch (e) {
+      debugPrint('Get last frame error: $e');
+    }
+
+    if (!mounted) return;
     setState(() {
       _autoEnabled = false;
+      _textureId = null;
     });
     try {
       await _channel.invokeMethod('stopCaptureSession');
@@ -342,6 +381,33 @@ class _CapturePageState extends State<CapturePage> {
   }
 
   Widget _buildImagePreview() {
+    if (_textureId != null) {
+      Widget image = Texture(textureId: _textureId!);
+      if (_textureWidth != null &&
+          _textureHeight != null &&
+          _textureHeight! > 0) {
+        image = AspectRatio(
+          aspectRatio: _textureWidth! / _textureHeight!,
+          child: image,
+        );
+      }
+      final ColorFilter? filter = _buildColorFilter();
+      if (filter != null) {
+        image = ColorFiltered(colorFilter: filter, child: image);
+      }
+      image = Transform(
+        alignment: Alignment.center,
+        transform: Matrix4.identity()
+          ..rotateZ(_rotationQuarterTurns * (pi / 2))
+          ..scale(_flipHorizontal ? -1.0 : 1.0, 1.0, 1.0),
+        child: image,
+      );
+      return InteractiveViewer(
+        minScale: 0.2,
+        maxScale: 5,
+        child: Center(child: image),
+      );
+    }
     if (_imageBytes == null || _imageBytes!.isEmpty) {
       return Container(
         alignment: Alignment.center,
