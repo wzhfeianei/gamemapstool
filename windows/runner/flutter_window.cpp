@@ -190,7 +190,6 @@ struct ProcessRecord {
 struct ProcessEntry {
   DWORD pid;
   std::wstring name;
-  double cpu;
   std::vector<uint8_t> icon_bytes;
 };
 
@@ -219,60 +218,8 @@ std::vector<ProcessRecord> EnumerateProcesses() {
   return records;
 }
 
-ULONGLONG FileTimeToUint64(const FILETIME& time) {
-  ULARGE_INTEGER value;
-  value.LowPart = time.dwLowDateTime;
-  value.HighPart = time.dwHighDateTime;
-  return value.QuadPart;
-}
+// CPU calculation helpers removed
 
-bool QueryProcessTime(DWORD pid, ULONGLONG* time) {
-  HANDLE handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
-  if (!handle) {
-    return false;
-  }
-  FILETIME creation_time;
-  FILETIME exit_time;
-  FILETIME kernel_time;
-  FILETIME user_time;
-  const BOOL ok =
-      GetProcessTimes(handle, &creation_time, &exit_time, &kernel_time,
-                      &user_time);
-  CloseHandle(handle);
-  if (!ok) {
-    return false;
-  }
-  *time = FileTimeToUint64(kernel_time) + FileTimeToUint64(user_time);
-  return true;
-}
-
-std::unordered_map<DWORD, ULONGLONG> CaptureProcessTimes() {
-  std::unordered_map<DWORD, ULONGLONG> times;
-
-
-  const std::vector<ProcessRecord> records = EnumerateProcesses();
-  for (const auto& record : records) {
-    ULONGLONG value = 0;
-    if (QueryProcessTime(record.pid, &value)) {
-      times[record.pid] = value;
-    }
-  }
-  return times;
-}
-
-double ComputeCpuPercent(ULONGLONG delta_time, ULONGLONG elapsed_time,
-                         DWORD processor_count) {
-  if (elapsed_time == 0 || processor_count == 0) {
-    return 0.0;
-  }
-  const double usage =
-      (static_cast<double>(delta_time) / static_cast<double>(elapsed_time)) *
-      100.0 / static_cast<double>(processor_count);
-  if (usage < 0.0) {
-    return 0.0;
-  }
-  return usage;
-}
 
 bool GetProcessImagePath(DWORD pid, std::wstring* path) {
   HANDLE handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
@@ -464,18 +411,6 @@ bool ExtractIconPng(const std::wstring& path, std::vector<uint8_t>* output) {
 }
 
 std::vector<ProcessEntry> ListProcessesDetailed() {
-  FILETIME start_time;
-  FILETIME end_time;
-  GetSystemTimeAsFileTime(&start_time);
-  const auto start_times = CaptureProcessTimes();
-  Sleep(200);
-  GetSystemTimeAsFileTime(&end_time);
-  const auto end_times = CaptureProcessTimes();
-  const ULONGLONG elapsed_time =
-      FileTimeToUint64(end_time) - FileTimeToUint64(start_time);
-  SYSTEM_INFO system_info;
-  GetSystemInfo(&system_info);
-  const DWORD processor_count = system_info.dwNumberOfProcessors;
   const std::vector<ProcessRecord> records = EnumerateProcesses();
   std::vector<ProcessEntry> entries;
   entries.reserve(records.size());
@@ -483,14 +418,7 @@ std::vector<ProcessEntry> ListProcessesDetailed() {
     ProcessEntry entry;
     entry.pid = record.pid;
     entry.name = record.name;
-    entry.cpu = 0.0;
     entry.icon_bytes.clear();
-    auto start_it = start_times.find(record.pid);
-    auto end_it = end_times.find(record.pid);
-    if (start_it != start_times.end() && end_it != end_times.end()) {
-      ULONGLONG delta = end_it->second - start_it->second;
-      entry.cpu = ComputeCpuPercent(delta, elapsed_time, processor_count);
-    }
     std::wstring path;
     if (GetProcessImagePath(record.pid, &path)) {
       ExtractIconPng(path, &entry.icon_bytes);
@@ -499,10 +427,7 @@ std::vector<ProcessEntry> ListProcessesDetailed() {
   }
   std::sort(entries.begin(), entries.end(),
             [](const ProcessEntry& left, const ProcessEntry& right) {
-              if (left.cpu == right.cpu) {
-                return left.name < right.name;
-              }
-              return left.cpu > right.cpu;
+              return left.name < right.name;
             });
   return entries;
 }
@@ -1084,8 +1009,6 @@ bool FlutterWindow::OnCreate() {
                 flutter::EncodableValue(static_cast<int64_t>(entry.pid));
             item[flutter::EncodableValue("name")] =
                 flutter::EncodableValue(WideToUtf8(entry.name));
-            item[flutter::EncodableValue("cpu")] =
-                flutter::EncodableValue(entry.cpu);
             item[flutter::EncodableValue("icon")] =
                 flutter::EncodableValue(entry.icon_bytes);
             list.emplace_back(item);
