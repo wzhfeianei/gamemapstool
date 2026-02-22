@@ -548,20 +548,32 @@ class _CapturePageState extends State<CapturePage> {
                   child: Text(_captureInProgress ? '截图中...' : '手动截图'),
                 ),
                 const SizedBox(width: 12),
-                FilledButton(
-                  onPressed: _isBusy
-                      ? null
-                      : (_autoEnabled ? _stopAutoCapture : _startAutoCapture),
-                  child: _isBusy
-                      ? const SizedBox(
-                          width: 20,
-                          height: 20,
-                          child: CircularProgressIndicator(
-                            strokeWidth: 2,
-                            color: Colors.white,
+                SizedBox(
+                  width: 140,
+                  height: 40,
+                  child: FilledButton(
+                    onPressed: _isBusy
+                        ? null
+                        : (_autoEnabled ? _stopAutoCapture : _startAutoCapture),
+                    child: Stack(
+                      alignment: Alignment.center,
+                      children: [
+                        Opacity(
+                          opacity: _isBusy ? 0 : 1,
+                          child: Text(_autoEnabled ? '停止实时捕获' : '开始实时捕获'),
+                        ),
+                        if (_isBusy)
+                          const SizedBox(
+                            width: 20,
+                            height: 20,
+                            child: CircularProgressIndicator(
+                              strokeWidth: 2,
+                              color: Colors.white,
+                            ),
                           ),
-                        )
-                      : Text(_autoEnabled ? '停止实时捕获' : '开始实时捕获'),
+                      ],
+                    ),
+                  ),
                 ),
               ],
             ),
