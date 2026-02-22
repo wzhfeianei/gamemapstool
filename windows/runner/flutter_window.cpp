@@ -647,7 +647,7 @@ bool CaptureWindowToPngBytesWgc(HWND hwnd, std::vector<uint8_t>* output,
     return false;
   }
   auto frame_pool =
-      winrt::Windows::Graphics::Capture::Direct3D11CaptureFramePool::Create(
+      winrt::Windows::Graphics::Capture::Direct3D11CaptureFramePool::CreateFreeThreaded(
           direct3d_device,
           winrt::Windows::Graphics::DirectX::DirectXPixelFormat::
               B8G8R8A8UIntNormalized,
@@ -938,6 +938,18 @@ bool FlutterWindow::OnCreate() {
       [this](const flutter::MethodCall<flutter::EncodableValue>& call,
              std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>>
                  result) {
+        if (call.method_name() == "startCaptureSession") {
+          StartCaptureSession(call, std::move(result));
+          return;
+        }
+        if (call.method_name() == "stopCaptureSession") {
+          StopCaptureSession(std::move(result));
+          return;
+        }
+        if (call.method_name() == "getCaptureFrame") {
+          GetCaptureFrame(std::move(result));
+          return;
+        }
         if (call.method_name() == "listProcesses") {
           const std::vector<ProcessEntry> processes = ListProcessesDetailed();
           flutter::EncodableList list;
@@ -1084,4 +1096,267 @@ FlutterWindow::MessageHandler(HWND hwnd, UINT const message,
   }
 
   return Win32Window::MessageHandler(hwnd, message, wparam, lparam);
+}
+
+void FlutterWindow::StartCaptureSession(
+    const flutter::MethodCall<flutter::EncodableValue>& call,
+    std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> result) {
+
+  const auto* args = std::get_if<flutter::EncodableMap>(call.arguments());
+  if (!args) {
+    result->Error("bad-args", "Missing arguments");
+    return;
+  }
+
+  DWORD target_pid = 0;
+  bool has_pid = false;
+  auto pid_it = args->find(flutter::EncodableValue("pid"));
+  if (pid_it != args->end()) {
+    if (std::holds_alternative<int32_t>(pid_it->second)) {
+      target_pid = static_cast<DWORD>(std::get<int32_t>(pid_it->second));
+      has_pid = target_pid != 0;
+    } else if (std::holds_alternative<int64_t>(pid_it->second)) {
+      target_pid = static_cast<DWORD>(std::get<int64_t>(pid_it->second));
+      has_pid = target_pid != 0;
+    }
+  }
+
+  std::wstring process_name;
+  if (!has_pid) {
+    auto process_it = args->find(flutter::EncodableValue("processName"));
+    if (process_it != args->end() && std::holds_alternative<std::string>(process_it->second)) {
+       process_name = Utf8ToWide(std::get<std::string>(process_it->second));
+    }
+  }
+  
+  const std::vector<ProcessRecord> records = EnumerateProcesses();
+  const auto children_map = BuildProcessChildrenMap(records);
+  std::set<DWORD> candidate_pids;
+  if (has_pid) {
+    const std::vector<DWORD> subtree = CollectProcessTreePids(target_pid, children_map);
+    candidate_pids.insert(subtree.begin(), subtree.end());
+  } else if (!process_name.empty()) {
+    const std::vector<DWORD> pids = FindPidsByName(process_name, records);
+    for (DWORD pid : pids) {
+      const std::vector<DWORD> subtree = CollectProcessTreePids(pid, children_map);
+      candidate_pids.insert(subtree.begin(), subtree.end());
+    }
+  }
+  
+  HWND hwnd = FindBestWindowForPids(candidate_pids);
+  if (!hwnd) {
+    result->Error("not-found", "Target window not found");
+    return;
+  }
+
+  StopCaptureSession(nullptr);
+
+  HRESULT hr = D3D11CreateDevice(
+      nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+      nullptr, 0, D3D11_SDK_VERSION, &d3d11_device_, nullptr, &d3d11_context_);
+  
+  if (FAILED(hr)) {
+    result->Error("d3d-error", "Failed to create D3D device");
+    return;
+  }
+
+  ComPtr<IDXGIDevice> dxgi_device;
+  hr = d3d11_device_.As(&dxgi_device);
+  if (FAILED(hr)) {
+     result->Error("dxgi-error", "Failed to get DXGI device");
+     return;
+  }
+
+  winrt::com_ptr<IInspectable> inspectable_device;
+  hr = CreateDirect3D11DeviceFromDXGIDevice(dxgi_device.Get(), inspectable_device.put());
+  if (FAILED(hr)) {
+     result->Error("winrt-error", "Failed to create WinRT device");
+     return;
+  }
+
+  device_ = inspectable_device.as<winrt::Windows::Graphics::DirectX::Direct3D11::IDirect3DDevice>();
+
+  auto interop = winrt::get_activation_factory<
+      winrt::Windows::Graphics::Capture::GraphicsCaptureItem,
+      IGraphicsCaptureItemInterop>();
+
+  hr = interop->CreateForWindow(
+      hwnd,
+      winrt::guid_of<winrt::Windows::Graphics::Capture::IGraphicsCaptureItem>(),
+      winrt::put_abi(item_));
+
+  if (FAILED(hr) || !item_) {
+    result->Error("capture-item-error", "Failed to create capture item");
+    return;
+  }
+
+  auto size = item_.Size();
+
+  try {
+    frame_pool_ = winrt::Windows::Graphics::Capture::Direct3D11CaptureFramePool::CreateFreeThreaded(
+        device_,
+        winrt::Windows::Graphics::DirectX::DirectXPixelFormat::B8G8R8A8UIntNormalized,
+        1, size);
+  } catch (...) {
+     frame_pool_ = winrt::Windows::Graphics::Capture::Direct3D11CaptureFramePool::Create(
+        device_,
+        winrt::Windows::Graphics::DirectX::DirectXPixelFormat::B8G8R8A8UIntNormalized,
+        1, size);
+  }
+
+  session_ = frame_pool_.CreateCaptureSession(item_);
+  session_.IsCursorCaptureEnabled(false);
+
+  frame_arrived_token_ = frame_pool_.FrameArrived({this, &FlutterWindow::OnFrameArrived});
+
+  try {
+    session_.StartCapture();
+    {
+        std::lock_guard<std::mutex> lock(frame_mutex_);
+        is_capturing_ = true;
+    }
+    result->Success();
+  } catch (...) {
+    StopCaptureSession(nullptr);
+    result->Error("start-failed", "Failed to start capture");
+  }
+}
+
+void FlutterWindow::StopCaptureSession(std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> result) {
+  {
+    std::lock_guard<std::mutex> lock(frame_mutex_);
+    is_capturing_ = false;
+    if (session_) {
+      session_.Close();
+      session_ = nullptr;
+    }
+    if (frame_pool_) {
+      frame_pool_.Close();
+      frame_pool_ = nullptr;
+    }
+    item_ = nullptr;
+    device_ = nullptr;
+    d3d11_context_ = nullptr;
+    staging_texture_ = nullptr;
+    last_frame_data_.clear();
+  }
+  if (result) {
+    result->Success();
+  }
+}
+
+void FlutterWindow::GetCaptureFrame(std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> result) {
+  std::vector<uint8_t> data;
+  {
+    std::lock_guard<std::mutex> lock(frame_mutex_);
+    data = last_frame_data_;
+  }
+  if (data.empty()) {
+      result->Success(flutter::EncodableValue(std::vector<uint8_t>()));
+  } else {
+      result->Success(flutter::EncodableValue(data));
+  }
+}
+
+void FlutterWindow::OnFrameArrived(
+    winrt::Windows::Graphics::Capture::Direct3D11CaptureFramePool const& sender,
+    winrt::Windows::Foundation::IInspectable const& args) {
+
+    // 1. Acquire lock to safely access members and check state
+    std::unique_lock<std::mutex> lock(frame_mutex_);
+    if (!is_capturing_ || !d3d11_context_ || !d3d11_device_) return;
+    
+    // 2. Get the frame (must be done before releasing lock? No, sender is thread safe, but safe to do here)
+    auto frame = sender.TryGetNextFrame();
+    if (!frame) return;
+
+    auto surface = frame.Surface();
+    auto interop_surface = surface.as<Windows::Graphics::DirectX::Direct3D11::IDirect3DDxgiInterfaceAccess>();
+    ComPtr<ID3D11Texture2D> texture;
+    HRESULT hr = interop_surface->GetInterface(IID_PPV_ARGS(&texture));
+    if (FAILED(hr)) return;
+
+    D3D11_TEXTURE2D_DESC desc;
+    texture->GetDesc(&desc);
+    
+    // 3. Check/Update staging texture (protected by lock)
+    if (!staging_texture_ || 
+        staging_desc_.Width != desc.Width || 
+        staging_desc_.Height != desc.Height ||
+        staging_desc_.Format != desc.Format) {
+        
+        staging_texture_ = nullptr;
+        D3D11_TEXTURE2D_DESC new_desc = desc;
+        new_desc.BindFlags = 0;
+        new_desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+        new_desc.Usage = D3D11_USAGE_STAGING;
+        new_desc.MiscFlags = 0;
+        
+        hr = d3d11_device_->CreateTexture2D(&new_desc, nullptr, &staging_texture_);
+        if (FAILED(hr)) return;
+        staging_desc_ = new_desc;
+    }
+
+    // 4. Create local copies to keep objects alive while unlocked
+    ComPtr<ID3D11DeviceContext> local_context = d3d11_context_;
+    ComPtr<ID3D11Texture2D> local_staging = staging_texture_;
+
+    // 5. Unlock to allow UI thread to call GetCaptureFrame without blocking
+    lock.unlock();
+
+    // 6. Perform heavy operations (GPU Copy, Map, Memcpy)
+    local_context->CopyResource(local_staging.Get(), texture.Get());
+    
+    D3D11_MAPPED_SUBRESOURCE mapped;
+    hr = local_context->Map(local_staging.Get(), 0, D3D11_MAP_READ, 0, &mapped);
+    if (FAILED(hr)) return;
+    
+    int width = desc.Width;
+    int height = desc.Height;
+    int src_stride = mapped.RowPitch;
+    // 24-bit BMP stride must be a multiple of 4 bytes
+    int dst_stride = (width * 3 + 3) & ~3;
+    int data_size = dst_stride * height;
+    int file_size = 54 + data_size;
+    
+    std::vector<uint8_t> bmp(file_size);
+    
+    // BITMAPFILEHEADER
+    bmp[0] = 'B'; bmp[1] = 'M';
+    *(int32_t*)&bmp[2] = file_size;
+    *(int32_t*)&bmp[6] = 0;
+    *(int32_t*)&bmp[10] = 54;
+    
+    // BITMAPINFOHEADER
+    *(int32_t*)&bmp[14] = 40;
+    *(int32_t*)&bmp[18] = width;
+    *(int32_t*)&bmp[22] = -height; // Top-down
+    *(int16_t*)&bmp[26] = 1;
+    *(int16_t*)&bmp[28] = 24; // 24-bit BGR (no alpha)
+    *(int32_t*)&bmp[30] = 0; // BI_RGB
+    *(int32_t*)&bmp[34] = data_size;
+    *(int32_t*)&bmp[38] = 0;
+    *(int32_t*)&bmp[42] = 0;
+    *(int32_t*)&bmp[46] = 0;
+    *(int32_t*)&bmp[50] = 0;
+    
+    uint8_t* src_base = (uint8_t*)mapped.pData;
+    uint8_t* dst_base = &bmp[54];
+    
+    for (int y = 0; y < height; ++y) {
+        uint8_t* src_row = src_base + y * src_stride;
+        uint8_t* dst_row = dst_base + y * dst_stride;
+        for (int x = 0; x < width; ++x) {
+            // BGRA -> BGR
+            dst_row[x * 3 + 0] = src_row[x * 4 + 0]; // B
+            dst_row[x * 3 + 1] = src_row[x * 4 + 1]; // G
+            dst_row[x * 3 + 2] = src_row[x * 4 + 2]; // R
+        }
+    }
+    
+    local_context->Unmap(local_staging.Get(), 0);
+    
+    // 7. Re-acquire lock to update shared state
+    lock.lock();
+    last_frame_data_ = std::move(bmp);
 }

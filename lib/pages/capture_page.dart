@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:math';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:gamemapstool/pages/settings_page.dart';
 
 class CapturePage extends StatefulWidget {
   const CapturePage({super.key});
@@ -14,12 +15,14 @@ class ProcessEntry {
   const ProcessEntry({
     required this.pid,
     required this.name,
+    this.windowTitle,
     required this.cpu,
     required this.iconBytes,
   });
 
   final int pid;
   final String name;
+  final String? windowTitle;
   final double cpu;
   final Uint8List? iconBytes;
 
@@ -43,11 +46,11 @@ class _CapturePageState extends State<CapturePage> {
   bool _processLoading = false;
   int _imageVersion = 0;
   final List<Map<String, String>> _captureModes = [
-    <String, String>{'value': 'auto', 'label': '自动'},
+    <String, String>{'value': 'bitblt', 'label': 'BitBlt'},
     <String, String>{'value': 'printWindow', 'label': 'PrintWindow'},
     <String, String>{'value': 'wgc', 'label': 'Graphics Capture'},
   ];
-  String _selectedCaptureMode = 'auto';
+  String _selectedCaptureMode = 'bitblt';
 
   Uint8List? _imageBytes;
   String? _errorMessage;
@@ -82,8 +85,9 @@ class _CapturePageState extends State<CapturePage> {
       _errorMessage = null;
     });
     try {
-      final List<Object?>? result =
-          await _channel.invokeMethod<List<Object?>>('listProcesses');
+      final List<Object?>? result = await _channel.invokeMethod<List<Object?>>(
+        'listProcesses',
+      );
       if (!mounted) {
         return;
       }
@@ -94,40 +98,53 @@ class _CapturePageState extends State<CapturePage> {
         }
         final Object? pidValue = item['pid'];
         final Object? nameValue = item['name'];
+        final Object? windowTitleValue = item['windowTitle'];
         final Object? cpuValue = item['cpu'];
         final Object? iconValue = item['icon'];
         final int pid = pidValue is int
             ? pidValue
             : pidValue is num
-                ? pidValue.toInt()
-                : 0;
-        final String name =
-            nameValue is String ? nameValue.trim() : nameValue?.toString() ?? '';
+            ? pidValue.toInt()
+            : 0;
+        final String name = nameValue is String
+            ? nameValue.trim()
+            : nameValue?.toString() ?? '';
+        final String? windowTitle =
+            windowTitleValue is String && windowTitleValue.isNotEmpty
+            ? windowTitleValue
+            : null;
         final double cpu = cpuValue is double
             ? cpuValue
             : cpuValue is num
-                ? cpuValue.toDouble()
-                : 0.0;
-        final Uint8List? icon =
-            iconValue is Uint8List ? iconValue : null;
+            ? cpuValue.toDouble()
+            : 0.0;
+        final Uint8List? icon = iconValue is Uint8List ? iconValue : null;
         if (pid > 0 && name.isNotEmpty) {
           processes.add(
-            ProcessEntry(pid: pid, name: name, cpu: cpu, iconBytes: icon),
+            ProcessEntry(
+              pid: pid,
+              name: name,
+              windowTitle: windowTitle,
+              cpu: cpu,
+              iconBytes: icon,
+            ),
           );
         }
       }
       final int? selectedPid = _selectedProcess?.pid;
-      setState(() {
-        _processList = processes;
-        if (selectedPid != null) {
-          for (final ProcessEntry entry in processes) {
-            if (entry.pid == selectedPid) {
-              _selectedProcess = entry;
-              break;
-            }
+      ProcessEntry? nextSelected;
+      if (selectedPid != null) {
+        for (final ProcessEntry entry in processes) {
+          if (entry.pid == selectedPid) {
+            nextSelected = entry;
+            break;
           }
         }
-        _selectedProcess ??= processes.isNotEmpty ? processes.first : null;
+      }
+      setState(() {
+        _processList = processes;
+        _selectedProcess =
+            nextSelected ?? (processes.isNotEmpty ? processes.first : null);
       });
     } on PlatformException catch (e) {
       if (!mounted) {
@@ -201,25 +218,82 @@ class _CapturePageState extends State<CapturePage> {
     }
   }
 
-  void _startAutoCapture() {
+  Future<void> _startAutoCapture() async {
     if (_autoEnabled) {
       return;
     }
+    final ProcessEntry? process = _selectedProcess;
+    if (process == null) {
+      setState(() {
+        _errorMessage = '请选择进程';
+      });
+      return;
+    }
+
     setState(() {
       _autoEnabled = true;
       _errorMessage = null;
     });
-    _autoTimer?.cancel();
-    _autoTimer = Timer.periodic(Duration(milliseconds: _intervalMs), (_) {
-      _captureOnce();
-    });
+
+    try {
+      await _channel.invokeMethod('startCaptureSession', <String, Object?>{
+        'pid': process.pid,
+        'processName': process.name,
+        'mode': _selectedCaptureMode,
+      });
+      _captureLoop();
+    } on PlatformException catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _autoEnabled = false;
+        _errorMessage = e.message ?? '启动捕获会话失败';
+      });
+    }
   }
 
-  void _stopAutoCapture() {
-    _autoTimer?.cancel();
+  Future<void> _captureLoop() async {
+    if (!_autoEnabled) return;
+
+    final Stopwatch stopwatch = Stopwatch()..start();
+    try {
+      final Uint8List? bytes = await _channel.invokeMethod<Uint8List>(
+        'getCaptureFrame',
+      );
+      stopwatch.stop();
+
+      if (!mounted || !_autoEnabled) return;
+
+      if (bytes != null && bytes.isNotEmpty) {
+        setState(() {
+          _imageBytes = bytes;
+          _lastCapturedAt = DateTime.now();
+          _lastCaptureDurationMs = stopwatch.elapsedMilliseconds;
+          _imageVersion++;
+        });
+      }
+    } catch (e) {
+      debugPrint('Capture frame error: $e');
+    }
+
+    // Schedule next frame immediately for real-time performance
+    if (_autoEnabled) {
+      // Use a small delay if needed, or 0 for max speed.
+      // Using Future.delayed(Duration.zero) to allow UI thread to breathe.
+      int delayMs = _intervalMs > 0 ? _intervalMs : 33; // Default to ~30 FPS
+      if (delayMs < 16) delayMs = 16; // Cap at ~60 FPS
+      Future.delayed(Duration(milliseconds: delayMs), _captureLoop);
+    }
+  }
+
+  Future<void> _stopAutoCapture() async {
     setState(() {
       _autoEnabled = false;
     });
+    try {
+      await _channel.invokeMethod('stopCaptureSession');
+    } catch (e) {
+      debugPrint('Stop capture session error: $e');
+    }
   }
 
   void _updateInterval(int value) {
@@ -244,10 +318,26 @@ class _CapturePageState extends State<CapturePage> {
       return null;
     }
     return const ColorFilter.matrix(<double>[
-      0.2126, 0.7152, 0.0722, 0, 0,
-      0.2126, 0.7152, 0.0722, 0, 0,
-      0.2126, 0.7152, 0.0722, 0, 0,
-      0, 0, 0, 1, 0,
+      0.2126,
+      0.7152,
+      0.0722,
+      0,
+      0,
+      0.2126,
+      0.7152,
+      0.0722,
+      0,
+      0,
+      0.2126,
+      0.7152,
+      0.0722,
+      0,
+      0,
+      0,
+      0,
+      0,
+      1,
+      0,
     ]);
   }
 
@@ -287,20 +377,29 @@ class _CapturePageState extends State<CapturePage> {
     final Widget icon = entry.iconBytes != null && entry.iconBytes!.isNotEmpty
         ? Image.memory(entry.iconBytes!, width: 20, height: 20)
         : const Icon(Icons.apps, size: 20);
+
+    final String displayName =
+        entry.windowTitle != null && entry.windowTitle!.isNotEmpty
+        ? '${entry.windowTitle} ${entry.name}'
+        : entry.name;
+    final String cpuText = 'CPU: ${entry.cpu.toStringAsFixed(1)}%';
+
     return Row(
-      mainAxisSize: MainAxisSize.min,
       children: [
         icon,
         const SizedBox(width: 8),
-        ConstrainedBox(
-          constraints: const BoxConstraints(maxWidth: 220),
+        Flexible(
           child: Text(
-            entry.name,
+            displayName,
             overflow: TextOverflow.ellipsis,
+            style: const TextStyle(fontWeight: FontWeight.w500),
           ),
         ),
         const SizedBox(width: 8),
-        Text('${entry.cpu.toStringAsFixed(1)}%'),
+        Text(
+          cpuText,
+          style: TextStyle(fontSize: 12, color: Colors.grey.shade600),
+        ),
       ],
     );
   }
@@ -311,9 +410,7 @@ class _CapturePageState extends State<CapturePage> {
         ? '尚未截图'
         : '最近截图：${_lastCapturedAt!.toLocal().toIso8601String()} 用时：${_lastCaptureDurationMs ?? 0} ms';
     return Scaffold(
-      appBar: AppBar(
-        title: const Text('游戏截图工具'),
-      ),
+      appBar: AppBar(title: const Text('游戏截图工具')),
       body: Padding(
         padding: const EdgeInsets.all(16),
         child: Column(
@@ -321,42 +418,65 @@ class _CapturePageState extends State<CapturePage> {
             Row(
               children: [
                 Expanded(
-                  child: DropdownButtonFormField<ProcessEntry>(
-                    key: ValueKey<int>(_selectedProcess?.pid ?? 0),
-                    initialValue: _selectedProcess,
-                    items: _processList
-                        .map((ProcessEntry entry) =>
-                            DropdownMenuItem<ProcessEntry>(
-                              value: entry,
-                              child: _buildProcessItem(entry),
-                            ))
-                        .toList(),
-                    onChanged: (ProcessEntry? value) {
-                      setState(() {
-                        _selectedProcess = value;
-                      });
-                    },
-                    decoration: const InputDecoration(
-                      labelText: '进程',
-                      border: OutlineInputBorder(),
+                  child: SizedBox(
+                    height: 40,
+                    child: DropdownButtonFormField<ProcessEntry>(
+                      key: ValueKey<int>(_selectedProcess?.pid ?? 0),
+                      initialValue: _selectedProcess,
+                      isExpanded: true,
+                      isDense: true,
+                      decoration: const InputDecoration(
+                        labelText: '进程',
+                        border: OutlineInputBorder(),
+                        contentPadding: EdgeInsets.symmetric(
+                          horizontal: 10,
+                          vertical: 8,
+                        ),
+                      ),
+                      items: _processList
+                          .map(
+                            (ProcessEntry entry) =>
+                                DropdownMenuItem<ProcessEntry>(
+                                  value: entry,
+                                  child: _buildProcessItem(entry),
+                                ),
+                          )
+                          .toList(),
+                      onChanged: (ProcessEntry? value) {
+                        setState(() {
+                          _selectedProcess = value;
+                        });
+                      },
                     ),
                   ),
                 ),
                 const SizedBox(width: 12),
                 SizedBox(
-                  width: 180,
+                  width: 140,
+                  height: 40,
                   child: DropdownButtonFormField<String>(
                     initialValue: _selectedCaptureMode,
                     isExpanded: true,
+                    isDense: true,
+                    decoration: const InputDecoration(
+                      labelText: '截图方式',
+                      border: OutlineInputBorder(),
+                      contentPadding: EdgeInsets.symmetric(
+                        horizontal: 10,
+                        vertical: 8,
+                      ),
+                    ),
                     items: _captureModes
-                        .map((Map<String, String> mode) =>
-                            DropdownMenuItem<String>(
-                              value: mode['value'],
-                              child: Text(
-                                mode['label'] ?? '',
-                                overflow: TextOverflow.ellipsis,
+                        .map(
+                          (Map<String, String> mode) =>
+                              DropdownMenuItem<String>(
+                                value: mode['value'],
+                                child: Text(
+                                  mode['label'] ?? '',
+                                  overflow: TextOverflow.ellipsis,
+                                ),
                               ),
-                            ))
+                        )
                         .toList(),
                     onChanged: (String? value) {
                       if (value == null) {
@@ -366,10 +486,6 @@ class _CapturePageState extends State<CapturePage> {
                         _selectedCaptureMode = value;
                       });
                     },
-                    decoration: const InputDecoration(
-                      labelText: '截图方式',
-                      border: OutlineInputBorder(),
-                    ),
                   ),
                 ),
                 const SizedBox(width: 12),
@@ -381,13 +497,13 @@ class _CapturePageState extends State<CapturePage> {
                 const SizedBox(width: 12),
                 OutlinedButton.icon(
                   onPressed: () async {
-                    final int? updatedInterval = await Navigator.of(context).push(
-                      MaterialPageRoute<int>(
-                        builder: (BuildContext context) => SettingsPage(
-                          intervalMs: _intervalMs,
-                        ),
-                      ),
-                    );
+                    final int? updatedInterval = await Navigator.of(context)
+                        .push(
+                          MaterialPageRoute<int>(
+                            builder: (BuildContext context) =>
+                                SettingsPage(intervalMs: _intervalMs),
+                          ),
+                        );
                     if (updatedInterval != null) {
                       _updateInterval(updatedInterval);
                     }
@@ -406,8 +522,10 @@ class _CapturePageState extends State<CapturePage> {
                 ),
                 const SizedBox(width: 12),
                 FilledButton(
-                  onPressed: _autoEnabled ? _stopAutoCapture : _startAutoCapture,
-                  child: Text(_autoEnabled ? '停止自动截图' : '开始自动截图'),
+                  onPressed: _autoEnabled
+                      ? _stopAutoCapture
+                      : _startAutoCapture,
+                  child: Text(_autoEnabled ? '停止实时捕获' : '开始实时捕获'),
                 ),
                 const SizedBox(width: 12),
                 OutlinedButton(
@@ -432,8 +550,7 @@ class _CapturePageState extends State<CapturePage> {
                 OutlinedButton.icon(
                   onPressed: () {
                     setState(() {
-                      _rotationQuarterTurns =
-                          (_rotationQuarterTurns + 1) % 4;
+                      _rotationQuarterTurns = (_rotationQuarterTurns + 1) % 4;
                     });
                   },
                   icon: const Icon(Icons.rotate_right),
@@ -483,85 +600,6 @@ class _CapturePageState extends State<CapturePage> {
                   borderRadius: BorderRadius.circular(8),
                 ),
                 child: _buildImagePreview(),
-              ),
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-}
-
-class SettingsPage extends StatefulWidget {
-  const SettingsPage({super.key, required this.intervalMs});
-
-  final int intervalMs;
-
-  @override
-  State<SettingsPage> createState() => _SettingsPageState();
-}
-
-class _SettingsPageState extends State<SettingsPage> {
-  late final TextEditingController _intervalController;
-  String? _errorMessage;
-
-  @override
-  void initState() {
-    super.initState();
-    _intervalController =
-        TextEditingController(text: widget.intervalMs.toString());
-  }
-
-  @override
-  void dispose() {
-    _intervalController.dispose();
-    super.dispose();
-  }
-
-  void _save() {
-    final int? value = int.tryParse(_intervalController.text.trim());
-    if (value == null || value <= 0) {
-      setState(() {
-        _errorMessage = '请输入大于0的毫秒数';
-      });
-      return;
-    }
-    Navigator.of(context).pop(value);
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return Scaffold(
-      appBar: AppBar(
-        title: const Text('配置'),
-      ),
-      body: Padding(
-        padding: const EdgeInsets.all(16),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            TextField(
-              controller: _intervalController,
-              decoration: const InputDecoration(
-                labelText: '自动截图间隔（毫秒）',
-                border: OutlineInputBorder(),
-              ),
-              keyboardType: TextInputType.number,
-              inputFormatters: [FilteringTextInputFormatter.digitsOnly],
-            ),
-            if (_errorMessage != null) ...[
-              const SizedBox(height: 8),
-              Text(
-                _errorMessage!,
-                style: TextStyle(color: Theme.of(context).colorScheme.error),
-              ),
-            ],
-            const SizedBox(height: 16),
-            Align(
-              alignment: Alignment.centerRight,
-              child: FilledButton(
-                onPressed: _save,
-                child: const Text('保存'),
               ),
             ),
           ],
