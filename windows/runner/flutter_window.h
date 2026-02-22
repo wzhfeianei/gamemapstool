@@ -79,6 +79,8 @@ class FlutterWindow : public Win32Window {
   int next_capture_id_ = 1;
   std::map<int, std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>>>
       pending_results_;
+  std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> pending_start_result_;
+  std::string pending_start_error_;
 
   // WGC Session State
   winrt::Windows::Graphics::Capture::GraphicsCaptureSession session_{nullptr};

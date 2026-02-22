@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:ui' as ui;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
@@ -15,12 +16,14 @@ class ProcessEntry {
     required this.name,
     this.windowTitle,
     required this.iconBytes,
+    this.cpu = 0.0,
   });
 
   final int pid;
   final String name;
   final String? windowTitle;
   final Uint8List? iconBytes;
+  final double cpu;
 
   @override
   bool operator ==(Object other) {
@@ -46,7 +49,7 @@ class _CapturePageState extends State<CapturePage> {
     <String, String>{'value': 'printWindow', 'label': 'PrintWindow'},
     <String, String>{'value': 'wgc', 'label': 'Graphics Capture'},
   ];
-  String _selectedCaptureMode = 'bitblt';
+  String _selectedCaptureMode = 'wgc';
 
   Uint8List? _imageBytes;
   String? _errorMessage;
@@ -59,6 +62,8 @@ class _CapturePageState extends State<CapturePage> {
   int? _textureId;
   double? _textureWidth;
   double? _textureHeight;
+  int? _imageWidth;
+  int? _imageHeight;
 
   @override
   void initState() {
@@ -96,6 +101,7 @@ class _CapturePageState extends State<CapturePage> {
         final Object? nameValue = item['name'];
         final Object? windowTitleValue = item['windowTitle'];
         final Object? iconValue = item['icon'];
+        final Object? cpuValue = item['cpu'];
         final int pid = pidValue is int
             ? pidValue
             : pidValue is num
@@ -109,6 +115,11 @@ class _CapturePageState extends State<CapturePage> {
             ? windowTitleValue
             : null;
         final Uint8List? icon = iconValue is Uint8List ? iconValue : null;
+        final double cpu = cpuValue is double
+            ? cpuValue
+            : cpuValue is num
+            ? cpuValue.toDouble()
+            : 0.0;
         if (pid > 0 && name.isNotEmpty) {
           processes.add(
             ProcessEntry(
@@ -116,6 +127,7 @@ class _CapturePageState extends State<CapturePage> {
               name: name,
               windowTitle: windowTitle,
               iconBytes: icon,
+              cpu: cpu,
             ),
           );
         }
@@ -188,8 +200,19 @@ class _CapturePageState extends State<CapturePage> {
         _imageVersion++;
         if (bytes == null || bytes.isEmpty) {
           _errorMessage = '未获取到截图数据';
+          _imageWidth = null;
+          _imageHeight = null;
         }
       });
+      if (bytes != null && bytes.isNotEmpty) {
+        final ui.Image image = await decodeImageFromList(bytes);
+        if (mounted) {
+          setState(() {
+            _imageWidth = image.width;
+            _imageHeight = image.height;
+          });
+        }
+      }
     } on PlatformException catch (e) {
       stopwatch.stop();
       if (!mounted) {
@@ -267,35 +290,33 @@ class _CapturePageState extends State<CapturePage> {
     if (!_autoEnabled) return;
     if (_textureId != null) return;
 
-    final Stopwatch stopwatch = Stopwatch()..start();
+    // Retry getting texture ID instead of falling back to slow PNG capture
     try {
-      final Uint8List? bytes = await _channel.invokeMethod<Uint8List>(
-        'getCaptureFrame',
-      );
-      stopwatch.stop();
-
-      if (!mounted || !_autoEnabled) return;
-
-      if (bytes != null && bytes.isNotEmpty) {
-        setState(() {
-          _imageBytes = bytes;
-          _lastCapturedAt = DateTime.now();
-          _lastCaptureDurationMs = stopwatch.elapsedMilliseconds;
-          _imageVersion++;
-        });
+      final Map<Object?, Object?>? result = await _channel
+          .invokeMapMethod<Object?, Object?>('getTextureId');
+      if (result != null) {
+        final int? tid = result['id'] as int?;
+        final int? w = result['width'] as int?;
+        final int? h = result['height'] as int?;
+        if (tid != null) {
+          if (mounted) {
+            setState(() {
+              _textureId = tid;
+              _textureWidth = w?.toDouble();
+              _textureHeight = h?.toDouble();
+            });
+          }
+          return; // Exit loop, texture is ready
+        }
       }
     } catch (e) {
-      debugPrint('Capture frame error: $e');
+      // debugPrint('Retry getTextureId failed: $e');
     }
 
-    // Schedule next frame immediately for real-time performance
-    if (_autoEnabled) {
-      // Use a small delay if needed, or 0 for max speed.
-      // Using Future.delayed(Duration.zero) to allow UI thread to breathe.
-      int delayMs = _intervalMs > 0 ? _intervalMs : 33; // Default to ~30 FPS
-      if (delayMs < 16) delayMs = 16; // Cap at ~60 FPS
-      Future.delayed(Duration(milliseconds: delayMs), _captureLoop);
-    }
+    if (!mounted || !_autoEnabled) return;
+
+    // Wait before retrying
+    Future<void>.delayed(const Duration(milliseconds: 500), _captureLoop);
   }
 
   Future<void> _stopAutoCapture() async {
@@ -332,12 +353,14 @@ class _CapturePageState extends State<CapturePage> {
       if (_textureWidth != null &&
           _textureHeight != null &&
           _textureHeight! > 0) {
-        image = AspectRatio(
-          aspectRatio: _textureWidth! / _textureHeight!,
+        image = SizedBox(
+          width: _textureWidth,
+          height: _textureHeight,
           child: image,
         );
       }
       return InteractiveViewer(
+        constrained: false,
         minScale: 0.2,
         maxScale: 5,
         child: Center(child: image),
@@ -354,9 +377,10 @@ class _CapturePageState extends State<CapturePage> {
       _imageBytes!,
       key: ValueKey<int>(_imageVersion),
       gaplessPlayback: true,
-      fit: BoxFit.contain,
+      fit: BoxFit.none,
     );
     return InteractiveViewer(
+      constrained: false,
       minScale: 0.2,
       maxScale: 5,
       child: Center(child: image),
@@ -377,9 +401,9 @@ class _CapturePageState extends State<CapturePage> {
       children: [
         icon,
         const SizedBox(width: 8),
-        Flexible(
+        Expanded(
           child: Text(
-            displayName,
+            '$displayName [CPU: ${entry.cpu.toStringAsFixed(1)}%]',
             overflow: TextOverflow.ellipsis,
             style: const TextStyle(fontWeight: FontWeight.w500),
           ),
@@ -390,9 +414,19 @@ class _CapturePageState extends State<CapturePage> {
 
   @override
   Widget build(BuildContext context) {
-    final String statusText = _lastCapturedAt == null
-        ? '尚未截图'
-        : '最近截图：${_lastCapturedAt!.toLocal().toIso8601String()} 用时：${_lastCaptureDurationMs ?? 0} ms';
+    String statusText = '尚未截图';
+    if (_lastCapturedAt != null) {
+      if (_textureId != null) {
+        statusText =
+            '分辨率：${_textureWidth?.toInt() ?? 0}x${_textureHeight?.toInt() ?? 0} 用时：${_lastCaptureDurationMs ?? 0} ms';
+      } else if (_imageWidth != null && _imageHeight != null) {
+        statusText =
+            '分辨率：${_imageWidth}x${_imageHeight} 用时：${_lastCaptureDurationMs ?? 0} ms';
+      } else {
+        statusText = '用时：${_lastCaptureDurationMs ?? 0} ms';
+      }
+    }
+
     return Scaffold(
       body: Padding(
         padding: const EdgeInsets.all(16),
@@ -408,17 +442,29 @@ class _CapturePageState extends State<CapturePage> {
                       initialValue: _selectedProcess,
                       isExpanded: true,
                       isDense: true,
-                      decoration: const InputDecoration(
+                      decoration: InputDecoration(
                         labelText: '进程',
-                        border: OutlineInputBorder(),
-                        contentPadding: EdgeInsets.symmetric(
+                        border: const OutlineInputBorder(),
+                        contentPadding: const EdgeInsets.symmetric(
                           horizontal: 10,
                           vertical: 8,
                         ),
+                        suffixIcon: IconButton(
+                          icon: _processLoading
+                              ? const SizedBox(
+                                  width: 24,
+                                  height: 24,
+                                  child: CircularProgressIndicator(
+                                    strokeWidth: 2,
+                                  ),
+                                )
+                              : const Icon(Icons.refresh),
+                          onPressed: _processLoading
+                              ? null
+                              : _refreshProcessList,
+                          tooltip: '刷新进程列表',
+                        ),
                       ),
-                      onTap: () {
-                        _refreshProcessList();
-                      },
                       items: _processList
                           .map(
                             (ProcessEntry entry) =>
@@ -474,12 +520,6 @@ class _CapturePageState extends State<CapturePage> {
                     },
                   ),
                 ),
-              ],
-            ),
-            const SizedBox(height: 12),
-            Row(
-              children: [
-                Expanded(child: Text(statusText)),
                 const SizedBox(width: 12),
                 ElevatedButton(
                   onPressed: _captureInProgress ? null : _captureOnce,
@@ -494,6 +534,8 @@ class _CapturePageState extends State<CapturePage> {
                 ),
               ],
             ),
+            const SizedBox(height: 12),
+            Row(children: [Expanded(child: Text(statusText))]),
             if (_errorMessage != null) ...[
               const SizedBox(height: 8),
               Align(

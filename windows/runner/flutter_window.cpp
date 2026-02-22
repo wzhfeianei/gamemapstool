@@ -190,6 +190,7 @@ struct ProcessRecord {
 struct ProcessEntry {
   DWORD pid;
   std::wstring name;
+  double cpu;
   std::vector<uint8_t> icon_bytes;
 };
 
@@ -218,7 +219,8 @@ std::vector<ProcessRecord> EnumerateProcesses() {
   return records;
 }
 
-// CPU calculation helpers removed
+// CPU calculation helpers restored
+
 
 
 bool GetProcessImagePath(DWORD pid, std::wstring* path) {
@@ -410,7 +412,73 @@ bool ExtractIconPng(const std::wstring& path, std::vector<uint8_t>* output) {
   return ok;
 }
 
+ULONGLONG FileTimeToUint64(const FILETIME& time) {
+  return (static_cast<ULONGLONG>(time.dwHighDateTime) << 32) |
+         time.dwLowDateTime;
+}
+
+bool QueryProcessTime(DWORD pid, ULONGLONG* time) {
+  HANDLE handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION,
+                              FALSE, pid);
+  if (!handle) {
+    return false;
+  }
+  FILETIME creation_time, exit_time, kernel_time, user_time;
+  const BOOL ok = GetProcessTimes(handle, &creation_time, &exit_time,
+                                  &kernel_time, &user_time);
+  CloseHandle(handle);
+  if (!ok) {
+    return false;
+  }
+  *time = FileTimeToUint64(kernel_time) + FileTimeToUint64(user_time);
+  return true;
+}
+
+std::unordered_map<DWORD, ULONGLONG> CaptureProcessTimes() {
+  std::unordered_map<DWORD, ULONGLONG> times;
+  HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+  if (snapshot == INVALID_HANDLE_VALUE) {
+    return times;
+  }
+  PROCESSENTRY32W entry;
+  entry.dwSize = sizeof(entry);
+  if (Process32FirstW(snapshot, &entry)) {
+    do {
+      ULONGLONG time;
+      if (QueryProcessTime(entry.th32ProcessID, &time)) {
+        times[entry.th32ProcessID] = time;
+      }
+    } while (Process32NextW(snapshot, &entry));
+  }
+  CloseHandle(snapshot);
+  return times;
+}
+
+double ComputeCpuPercent(ULONGLONG delta_time, ULONGLONG elapsed_time,
+                         DWORD processor_count) {
+  if (elapsed_time == 0) {
+    return 0.0;
+  }
+  const double cpu = static_cast<double>(delta_time) /
+                     static_cast<double>(elapsed_time) /
+                     static_cast<double>(processor_count);
+  return cpu * 100.0;
+}
+
 std::vector<ProcessEntry> ListProcessesDetailed() {
+  FILETIME start_time;
+  FILETIME end_time;
+  GetSystemTimeAsFileTime(&start_time);
+  const auto start_times = CaptureProcessTimes();
+  Sleep(200);
+  GetSystemTimeAsFileTime(&end_time);
+  const auto end_times = CaptureProcessTimes();
+  const ULONGLONG elapsed_time =
+      FileTimeToUint64(end_time) - FileTimeToUint64(start_time);
+  SYSTEM_INFO system_info;
+  GetSystemInfo(&system_info);
+  const DWORD processor_count = system_info.dwNumberOfProcessors;
+
   const std::vector<ProcessRecord> records = EnumerateProcesses();
   std::vector<ProcessEntry> entries;
   entries.reserve(records.size());
@@ -418,6 +486,23 @@ std::vector<ProcessEntry> ListProcessesDetailed() {
     ProcessEntry entry;
     entry.pid = record.pid;
     entry.name = record.name;
+    entry.cpu = 0.0;
+    
+    auto it_start = start_times.find(record.pid);
+    auto it_end = end_times.find(record.pid);
+    if (it_start != start_times.end() && it_end != end_times.end()) {
+        ULONGLONG delta = 0;
+        if (it_end->second > it_start->second) {
+            delta = it_end->second - it_start->second;
+        }
+        entry.cpu = ComputeCpuPercent(delta, elapsed_time, processor_count);
+    }
+    
+    // Filter: Only show processes with CPU > 0
+    // if (entry.cpu <= 0.0) {
+    //     continue;
+    // }
+
     entry.icon_bytes.clear();
     std::wstring path;
     if (GetProcessImagePath(record.pid, &path)) {
@@ -427,7 +512,7 @@ std::vector<ProcessEntry> ListProcessesDetailed() {
   }
   std::sort(entries.begin(), entries.end(),
             [](const ProcessEntry& left, const ProcessEntry& right) {
-              return left.name < right.name;
+              return left.cpu > right.cpu; // Sort by CPU usage descending
             });
   return entries;
 }
@@ -1009,6 +1094,8 @@ bool FlutterWindow::OnCreate() {
                 flutter::EncodableValue(static_cast<int64_t>(entry.pid));
             item[flutter::EncodableValue("name")] =
                 flutter::EncodableValue(WideToUtf8(entry.name));
+            item[flutter::EncodableValue("cpu")] =
+                flutter::EncodableValue(entry.cpu);
             item[flutter::EncodableValue("icon")] =
                 flutter::EncodableValue(entry.icon_bytes);
             list.emplace_back(item);
@@ -1139,6 +1226,16 @@ FlutterWindow::MessageHandler(HWND hwnd, UINT const message,
   switch (message) {
     case WM_FONTCHANGE:
       flutter_controller_->engine()->ReloadSystemFonts();
+      break;
+    case WM_CAPTURE_COMPLETE:
+      if (pending_start_result_) {
+        if (wparam == 1) { // Success
+          pending_start_result_->Success();
+        } else { // Failure
+          pending_start_result_->Error("start-failed", pending_start_error_.empty() ? "Capture failed" : pending_start_error_);
+        }
+        pending_start_result_ = nullptr;
+      }
       break;
   }
 
@@ -1287,104 +1384,105 @@ void FlutterWindow::StartCaptureSession(
       capture_mode = std::get<std::string>(mode_it->second);
   }
   
-  const std::vector<ProcessRecord> records = EnumerateProcesses();
-  const auto children_map = BuildProcessChildrenMap(records);
-  std::set<DWORD> candidate_pids;
-  if (has_pid) {
-    const std::vector<DWORD> subtree = CollectProcessTreePids(target_pid, children_map);
-    candidate_pids.insert(subtree.begin(), subtree.end());
-  } else if (!process_name.empty()) {
-    const std::vector<DWORD> pids = FindPidsByName(process_name, records);
-    for (DWORD pid : pids) {
-      const std::vector<DWORD> subtree = CollectProcessTreePids(pid, children_map);
-      candidate_pids.insert(subtree.begin(), subtree.end());
+  // Store the result to be completed later
+  pending_start_result_ = std::move(result);
+  pending_start_error_.clear();
+
+  // Spawn a thread to perform the setup asynchronously
+  std::thread([this, target_pid, has_pid, process_name, capture_mode]() {
+    try {
+      // 1. Stop previous session (this might block joining threads)
+      StopCaptureSession(nullptr);
+
+      // 2. Find target window
+      const std::vector<ProcessRecord> records = EnumerateProcesses();
+      const auto children_map = BuildProcessChildrenMap(records);
+      std::set<DWORD> candidate_pids;
+      if (has_pid) {
+        const std::vector<DWORD> subtree = CollectProcessTreePids(target_pid, children_map);
+        candidate_pids.insert(subtree.begin(), subtree.end());
+      } else if (!process_name.empty()) {
+        const std::vector<DWORD> pids = FindPidsByName(process_name, records);
+        for (DWORD pid : pids) {
+          const std::vector<DWORD> subtree = CollectProcessTreePids(pid, children_map);
+          candidate_pids.insert(subtree.begin(), subtree.end());
+        }
+      }
+      
+      HWND hwnd = FindBestWindowForPids(candidate_pids);
+      if (!hwnd) {
+        throw std::runtime_error("Target window not found");
+      }
+
+      // 3. Start Capture
+      if (capture_mode != "wgc") {
+          gdi_capturing_ = true;
+          gdi_capture_thread_ = std::thread(&FlutterWindow::GdiCaptureLoop, this, hwnd, capture_mode);
+      } else {
+          HRESULT hr = D3D11CreateDevice(
+              nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+              nullptr, 0, D3D11_SDK_VERSION, &d3d11_device_, nullptr, &d3d11_context_);
+          
+          if (FAILED(hr)) throw std::runtime_error("Failed to create D3D device");
+
+          ComPtr<IDXGIDevice> dxgi_device;
+          hr = d3d11_device_.As(&dxgi_device);
+          if (FAILED(hr)) throw std::runtime_error("Failed to get DXGI device");
+
+          winrt::com_ptr<IInspectable> inspectable_device;
+          hr = CreateDirect3D11DeviceFromDXGIDevice(dxgi_device.Get(), inspectable_device.put());
+          if (FAILED(hr)) throw std::runtime_error("Failed to create WinRT device");
+
+          device_ = inspectable_device.as<winrt::Windows::Graphics::DirectX::Direct3D11::IDirect3DDevice>();
+
+          auto interop = winrt::get_activation_factory<
+              winrt::Windows::Graphics::Capture::GraphicsCaptureItem,
+              IGraphicsCaptureItemInterop>();
+
+          hr = interop->CreateForWindow(
+              hwnd,
+              winrt::guid_of<winrt::Windows::Graphics::Capture::IGraphicsCaptureItem>(),
+              winrt::put_abi(item_));
+
+          if (FAILED(hr) || !item_) throw std::runtime_error("Failed to create capture item");
+
+          auto size = item_.Size();
+
+          try {
+            frame_pool_ = winrt::Windows::Graphics::Capture::Direct3D11CaptureFramePool::CreateFreeThreaded(
+                device_,
+                winrt::Windows::Graphics::DirectX::DirectXPixelFormat::B8G8R8A8UIntNormalized,
+                1, size);
+          } catch (...) {
+             frame_pool_ = winrt::Windows::Graphics::Capture::Direct3D11CaptureFramePool::Create(
+                device_,
+                winrt::Windows::Graphics::DirectX::DirectXPixelFormat::B8G8R8A8UIntNormalized,
+                1, size);
+          }
+
+          session_ = frame_pool_.CreateCaptureSession(item_);
+          session_.IsCursorCaptureEnabled(false);
+
+          frame_arrived_token_ = frame_pool_.FrameArrived({this, &FlutterWindow::OnFrameArrived});
+
+          session_.StartCapture();
+          {
+              std::lock_guard<std::mutex> lock(frame_mutex_);
+              is_capturing_ = true;
+          }
+      }
+
+      // Success
+      PostMessage(GetHandle(), WM_CAPTURE_COMPLETE, 1, 0);
+
+    } catch (const std::exception& e) {
+      pending_start_error_ = e.what();
+      PostMessage(GetHandle(), WM_CAPTURE_COMPLETE, 0, 0);
+    } catch (...) {
+      pending_start_error_ = "Unknown error during capture setup";
+      PostMessage(GetHandle(), WM_CAPTURE_COMPLETE, 0, 0);
     }
-  }
-  
-  HWND hwnd = FindBestWindowForPids(candidate_pids);
-  if (!hwnd) {
-    result->Error("not-found", "Target window not found");
-    return;
-  }
-
-  StopCaptureSession(nullptr);
-
-  if (capture_mode != "wgc") {
-      gdi_capturing_ = true;
-      gdi_capture_thread_ = std::thread(&FlutterWindow::GdiCaptureLoop, this, hwnd, capture_mode);
-      result->Success();
-      return;
-  }
-
-  HRESULT hr = D3D11CreateDevice(
-      nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
-      nullptr, 0, D3D11_SDK_VERSION, &d3d11_device_, nullptr, &d3d11_context_);
-  
-  if (FAILED(hr)) {
-    result->Error("d3d-error", "Failed to create D3D device");
-    return;
-  }
-
-  ComPtr<IDXGIDevice> dxgi_device;
-  hr = d3d11_device_.As(&dxgi_device);
-  if (FAILED(hr)) {
-     result->Error("dxgi-error", "Failed to get DXGI device");
-     return;
-  }
-
-  winrt::com_ptr<IInspectable> inspectable_device;
-  hr = CreateDirect3D11DeviceFromDXGIDevice(dxgi_device.Get(), inspectable_device.put());
-  if (FAILED(hr)) {
-     result->Error("winrt-error", "Failed to create WinRT device");
-     return;
-  }
-
-  device_ = inspectable_device.as<winrt::Windows::Graphics::DirectX::Direct3D11::IDirect3DDevice>();
-
-  auto interop = winrt::get_activation_factory<
-      winrt::Windows::Graphics::Capture::GraphicsCaptureItem,
-      IGraphicsCaptureItemInterop>();
-
-  hr = interop->CreateForWindow(
-      hwnd,
-      winrt::guid_of<winrt::Windows::Graphics::Capture::IGraphicsCaptureItem>(),
-      winrt::put_abi(item_));
-
-  if (FAILED(hr) || !item_) {
-    result->Error("capture-item-error", "Failed to create capture item");
-    return;
-  }
-
-  auto size = item_.Size();
-
-  try {
-    frame_pool_ = winrt::Windows::Graphics::Capture::Direct3D11CaptureFramePool::CreateFreeThreaded(
-        device_,
-        winrt::Windows::Graphics::DirectX::DirectXPixelFormat::B8G8R8A8UIntNormalized,
-        1, size);
-  } catch (...) {
-     frame_pool_ = winrt::Windows::Graphics::Capture::Direct3D11CaptureFramePool::Create(
-        device_,
-        winrt::Windows::Graphics::DirectX::DirectXPixelFormat::B8G8R8A8UIntNormalized,
-        1, size);
-  }
-
-  session_ = frame_pool_.CreateCaptureSession(item_);
-  session_.IsCursorCaptureEnabled(false);
-
-  frame_arrived_token_ = frame_pool_.FrameArrived({this, &FlutterWindow::OnFrameArrived});
-
-  try {
-    session_.StartCapture();
-    {
-        std::lock_guard<std::mutex> lock(frame_mutex_);
-        is_capturing_ = true;
-    }
-    result->Success();
-  } catch (...) {
-    StopCaptureSession(nullptr);
-    result->Error("start-failed", "Failed to start capture");
-  }
+  }).detach();
 }
 
 void FlutterWindow::StopCaptureSession(std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> result) {
