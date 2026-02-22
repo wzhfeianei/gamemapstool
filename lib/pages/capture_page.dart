@@ -43,6 +43,7 @@ class _CapturePageState extends State<CapturePage> {
   List<ProcessEntry> _processList = [];
   ProcessEntry? _selectedProcess;
   bool _processLoading = false;
+  bool _isBusy = false; // Prevents re-entry during async ops
   int _imageVersion = 0;
   final List<Map<String, String>> _captureModes = [
     <String, String>{'value': 'bitblt', 'label': 'BitBlt'},
@@ -232,7 +233,7 @@ class _CapturePageState extends State<CapturePage> {
   }
 
   Future<void> _startAutoCapture() async {
-    if (_autoEnabled) {
+    if (_autoEnabled || _isBusy) {
       return;
     }
     final ProcessEntry? process = _selectedProcess;
@@ -244,7 +245,7 @@ class _CapturePageState extends State<CapturePage> {
     }
 
     setState(() {
-      _autoEnabled = true;
+      _isBusy = true;
       _errorMessage = null;
     });
 
@@ -253,6 +254,11 @@ class _CapturePageState extends State<CapturePage> {
         'pid': process.pid,
         'processName': process.name,
         'mode': _selectedCaptureMode,
+      });
+
+      if (!mounted) return;
+      setState(() {
+        _autoEnabled = true;
       });
 
       // Try to get texture ID for all modes as they all support it now
@@ -276,6 +282,7 @@ class _CapturePageState extends State<CapturePage> {
         // Fallback to manual loop if texture is not available
       }
 
+      // Start the loop without awaiting it, as it runs indefinitely until stopped
       _captureLoop();
     } on PlatformException catch (e) {
       if (!mounted) return;
@@ -283,6 +290,12 @@ class _CapturePageState extends State<CapturePage> {
         _autoEnabled = false;
         _errorMessage = e.message ?? '启动捕获会话失败';
       });
+    } finally {
+      if (mounted) {
+        setState(() {
+          _isBusy = false;
+        });
+      }
     }
   }
 
@@ -320,30 +333,39 @@ class _CapturePageState extends State<CapturePage> {
   }
 
   Future<void> _stopAutoCapture() async {
+    if (_isBusy) return;
+    setState(() {
+      _isBusy = true;
+    });
+
     try {
+      // Try to get one last frame before stopping
       if (_textureId != null) {
-        final Uint8List? lastFrame = await _channel.invokeMethod(
-          'getLastFrame',
-        );
-        if (lastFrame != null && mounted) {
-          setState(() {
-            _imageBytes = lastFrame;
-          });
+        try {
+          final Uint8List? lastFrame = await _channel.invokeMethod(
+            'getLastFrame',
+          );
+          if (lastFrame != null && mounted) {
+            setState(() {
+              _imageBytes = lastFrame;
+            });
+          }
+        } catch (e) {
+          // Ignore last frame error
         }
       }
-    } catch (e) {
-      debugPrint('Get last frame error: $e');
-    }
 
-    if (!mounted) return;
-    setState(() {
-      _autoEnabled = false;
-      _textureId = null;
-    });
-    try {
       await _channel.invokeMethod('stopCaptureSession');
     } catch (e) {
       debugPrint('Stop capture session error: $e');
+    } finally {
+      if (mounted) {
+        setState(() {
+          _autoEnabled = false;
+          _textureId = null;
+          _isBusy = false;
+        });
+      }
     }
   }
 
@@ -526,11 +548,32 @@ class _CapturePageState extends State<CapturePage> {
                   child: Text(_captureInProgress ? '截图中...' : '手动截图'),
                 ),
                 const SizedBox(width: 12),
-                FilledButton(
-                  onPressed: _autoEnabled
-                      ? _stopAutoCapture
-                      : _startAutoCapture,
-                  child: Text(_autoEnabled ? '停止实时捕获' : '开始实时捕获'),
+                SizedBox(
+                  width: 140,
+                  height: 40,
+                  child: FilledButton(
+                    onPressed: _isBusy
+                        ? null
+                        : (_autoEnabled ? _stopAutoCapture : _startAutoCapture),
+                    child: Stack(
+                      alignment: Alignment.center,
+                      children: [
+                        Opacity(
+                          opacity: _isBusy ? 0 : 1,
+                          child: Text(_autoEnabled ? '停止实时捕获' : '开始实时捕获'),
+                        ),
+                        if (_isBusy)
+                          const SizedBox(
+                            width: 20,
+                            height: 20,
+                            child: CircularProgressIndicator(
+                              strokeWidth: 2,
+                              color: Colors.white,
+                            ),
+                          ),
+                      ],
+                    ),
+                  ),
                 ),
               ],
             ),
