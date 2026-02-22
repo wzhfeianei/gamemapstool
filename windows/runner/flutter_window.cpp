@@ -49,6 +49,7 @@ CaptureTexture::~CaptureTexture() {
 }
 
 void CaptureTexture::UpdateFrame(const uint8_t* data, size_t width, size_t height, size_t row_pitch, bool force_opaque) {
+  if (!data) return;
   const std::lock_guard<std::mutex> lock(mutex_);
   
   if (width_ != width || height_ != height) {
@@ -1244,73 +1245,78 @@ void FlutterWindow::GdiCaptureLoop(HWND hwnd, std::string mode) {
   bmi.bmiHeader.biCompression = BI_RGB;
 
   while (gdi_capturing_) {
-    auto start_time = std::chrono::steady_clock::now();
+    try {
+      auto start_time = std::chrono::steady_clock::now();
 
-    // 2. Check window validity
-    if (!IsWindow(hwnd) || !IsWindowVisible(hwnd)) {
-       std::this_thread::sleep_for(std::chrono::milliseconds(100));
-       continue;
-    }
-
-    // 3. Get Window Size
-    RECT rect;
-    if (!GetClientRect(hwnd, &rect)) {
+      // 2. Check window validity
+      if (!IsWindow(hwnd) || !IsWindowVisible(hwnd)) {
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
         continue;
-    }
-    int width = rect.right - rect.left;
-    int height = rect.bottom - rect.top;
+      }
 
-    if (width <= 0 || height <= 0) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
-        continue;
-    }
+      // 3. Get Window Size
+      RECT rect;
+      if (!GetClientRect(hwnd, &rect)) {
+          std::this_thread::sleep_for(std::chrono::milliseconds(100));
+          continue;
+      }
+      int width = rect.right - rect.left;
+      int height = rect.bottom - rect.top;
 
-    // 4. Recreate bitmap if size changed or first run
-    if (!hbitmap || width != last_width || height != last_height) {
-        if (old_object) SelectObject(hdc_mem, old_object);
-        if (hbitmap) DeleteObject(hbitmap);
+      if (width <= 0 || height <= 0) {
+          std::this_thread::sleep_for(std::chrono::milliseconds(100));
+          continue;
+      }
 
-        bmi.bmiHeader.biWidth = width;
-        bmi.bmiHeader.biHeight = -height; // Top-down
+      // 4. Recreate bitmap if size changed or first run
+      if (!hbitmap || width != last_width || height != last_height) {
+          if (old_object) SelectObject(hdc_mem, old_object);
+          if (hbitmap) DeleteObject(hbitmap);
 
-        // Always use DIB Section for direct access and best performance
-        // This avoids GetDIBits overhead and potential failure points
-        hbitmap = CreateDIBSection(hdc_mem, &bmi, DIB_RGB_COLORS, &bits, nullptr, 0);
+          bmi.bmiHeader.biWidth = width;
+          bmi.bmiHeader.biHeight = -height; // Top-down
 
-        if (!hbitmap) {
-             std::this_thread::sleep_for(std::chrono::milliseconds(100));
-             continue;
-        }
-        old_object = SelectObject(hdc_mem, hbitmap);
-        last_width = width;
-        last_height = height;
-    }
+          // Always use DIB Section for direct access and best performance
+          // This avoids GetDIBits overhead and potential failure points
+          hbitmap = CreateDIBSection(hdc_mem, &bmi, DIB_RGB_COLORS, &bits, nullptr, 0);
 
-    // 5. Perform Capture
-    bool success = false;
-    if (mode == "bitblt") {
-        success = BitBlt(hdc_mem, 0, 0, width, height, hdc_window, 0, 0, SRCCOPY | CAPTUREBLT);
-    } else {
-        // PrintWindow with PW_CLIENTONLY | PW_RENDERFULLCONTENT (0x3)
-        success = PrintWindow(hwnd, hdc_mem, 0x3);
-        if (!success) {
-             success = PrintWindow(hwnd, hdc_mem, 0x2);
-        }
-    }
+          if (!hbitmap) {
+              std::this_thread::sleep_for(std::chrono::milliseconds(100));
+              continue;
+          }
+          old_object = SelectObject(hdc_mem, hbitmap);
+          last_width = width;
+          last_height = height;
+      }
 
-    if (success && capture_texture_) {
-        // 6. Update Texture
-        // Direct access via bits pointer (DIB Section)
-        // Alpha channel is often 0 for GDI capture, so force_opaque=true is critical
-        capture_texture_->UpdateFrame(static_cast<uint8_t*>(bits), width, height, width * 4, true);
-    }
+      // 5. Perform Capture
+      bool success = false;
+      if (mode == "bitblt") {
+          success = BitBlt(hdc_mem, 0, 0, width, height, hdc_window, 0, 0, SRCCOPY | CAPTUREBLT);
+      } else {
+          // PrintWindow with PW_CLIENTONLY | PW_RENDERFULLCONTENT (0x3)
+          success = PrintWindow(hwnd, hdc_mem, 0x3);
+          if (!success) {
+              success = PrintWindow(hwnd, hdc_mem, 0x2);
+          }
+      }
 
-    // 7. Frame pacing (Aim for ~30 FPS = 33ms)
-    auto end_time = std::chrono::steady_clock::now();
-    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time).count();
-    if (elapsed < 33) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(33 - elapsed));
+      if (success && capture_texture_) {
+          // 6. Update Texture
+          // Direct access via bits pointer (DIB Section)
+          // Alpha channel is often 0 for GDI capture, so force_opaque=true is critical
+          capture_texture_->UpdateFrame(static_cast<uint8_t*>(bits), width, height, width * 4, true);
+      }
+
+      // 7. Frame pacing (Aim for ~30 FPS = 33ms)
+      auto end_time = std::chrono::steady_clock::now();
+      auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time).count();
+      if (elapsed < 33) {
+          std::this_thread::sleep_for(std::chrono::milliseconds(33 - elapsed));
+      }
+    } catch (...) {
+      // Prevent thread crash, just sleep and retry
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
   }
 
@@ -1640,58 +1646,67 @@ void FlutterWindow::OnFrameArrived(
     winrt::Windows::Graphics::Capture::Direct3D11CaptureFramePool const& sender,
     winrt::Windows::Foundation::IInspectable const& args) {
 
-    // 1. Acquire lock to safely access members and check state
-    std::unique_lock<std::mutex> lock(frame_mutex_);
-    if (!is_capturing_ || !d3d11_context_ || !d3d11_device_) return;
-    
-    // 2. Get the frame (must be done before releasing lock? No, sender is thread safe, but safe to do here)
-    auto frame = sender.TryGetNextFrame();
-    if (!frame) return;
-
-    auto surface = frame.Surface();
-    auto interop_surface = surface.as<Windows::Graphics::DirectX::Direct3D11::IDirect3DDxgiInterfaceAccess>();
-    ComPtr<ID3D11Texture2D> texture;
-    HRESULT hr = interop_surface->GetInterface(IID_PPV_ARGS(&texture));
-    if (FAILED(hr)) return;
-
-    D3D11_TEXTURE2D_DESC desc;
-    texture->GetDesc(&desc);
-    
-    // 3. Check/Update staging texture (protected by lock)
-    if (!staging_texture_ || 
-        staging_desc_.Width != desc.Width || 
-        staging_desc_.Height != desc.Height ||
-        staging_desc_.Format != desc.Format) {
+    try {
+        // 1. Acquire lock to safely access members and check state
+        std::unique_lock<std::mutex> lock(frame_mutex_);
+        if (!is_capturing_ || !d3d11_context_ || !d3d11_device_) return;
         
-        staging_texture_ = nullptr;
-        D3D11_TEXTURE2D_DESC new_desc = desc;
-        new_desc.BindFlags = 0;
-        new_desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-        new_desc.Usage = D3D11_USAGE_STAGING;
-        new_desc.MiscFlags = 0;
+        // 2. Get the frame (must be done before releasing lock? No, sender is thread safe, but safe to do here)
+        auto frame = sender.TryGetNextFrame();
+        if (!frame) return;
+
+        auto surface = frame.Surface();
+        auto interop_surface = surface.as<Windows::Graphics::DirectX::Direct3D11::IDirect3DDxgiInterfaceAccess>();
+        ComPtr<ID3D11Texture2D> texture;
+        HRESULT hr = interop_surface->GetInterface(IID_PPV_ARGS(&texture));
+        if (FAILED(hr)) {
+             // If device lost, we might need to handle it. For now, just log and return.
+             // OutputDebugStringA("Failed to get texture interface\n");
+             return;
+        }
+
+        D3D11_TEXTURE2D_DESC desc;
+        texture->GetDesc(&desc);
         
-        hr = d3d11_device_->CreateTexture2D(&new_desc, nullptr, &staging_texture_);
+        // 3. Check/Update staging texture (protected by lock)
+        if (!staging_texture_ || 
+            staging_desc_.Width != desc.Width || 
+            staging_desc_.Height != desc.Height ||
+            staging_desc_.Format != desc.Format) {
+            
+            staging_texture_ = nullptr;
+            D3D11_TEXTURE2D_DESC new_desc = desc;
+            new_desc.BindFlags = 0;
+            new_desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+            new_desc.Usage = D3D11_USAGE_STAGING;
+            new_desc.MiscFlags = 0;
+            
+            hr = d3d11_device_->CreateTexture2D(&new_desc, nullptr, &staging_texture_);
+            if (FAILED(hr)) return;
+            staging_desc_ = new_desc;
+        }
+
+        // 4. Create local copies to keep objects alive while unlocked
+        ComPtr<ID3D11DeviceContext> local_context = d3d11_context_;
+        ComPtr<ID3D11Texture2D> local_staging = staging_texture_;
+
+        // 5. Unlock to allow UI thread to call GetCaptureFrame without blocking
+        lock.unlock();
+
+        // 6. Perform heavy operations (GPU Copy, Map, Memcpy)
+        local_context->CopyResource(local_staging.Get(), texture.Get());
+        
+        D3D11_MAPPED_SUBRESOURCE mapped;
+        hr = local_context->Map(local_staging.Get(), 0, D3D11_MAP_READ, 0, &mapped);
         if (FAILED(hr)) return;
-        staging_desc_ = new_desc;
+        
+        if (capture_texture_) {
+            capture_texture_->UpdateFrame((uint8_t*)mapped.pData, desc.Width, desc.Height, mapped.RowPitch);
+        }
+        
+        local_context->Unmap(local_staging.Get(), 0);
+    } catch (...) {
+        // Catch all exceptions to prevent crash from winrt or other issues
+        // OutputDebugStringA("Exception in OnFrameArrived\n");
     }
-
-    // 4. Create local copies to keep objects alive while unlocked
-    ComPtr<ID3D11DeviceContext> local_context = d3d11_context_;
-    ComPtr<ID3D11Texture2D> local_staging = staging_texture_;
-
-    // 5. Unlock to allow UI thread to call GetCaptureFrame without blocking
-    lock.unlock();
-
-    // 6. Perform heavy operations (GPU Copy, Map, Memcpy)
-    local_context->CopyResource(local_staging.Get(), texture.Get());
-    
-    D3D11_MAPPED_SUBRESOURCE mapped;
-    hr = local_context->Map(local_staging.Get(), 0, D3D11_MAP_READ, 0, &mapped);
-    if (FAILED(hr)) return;
-    
-    if (capture_texture_) {
-        capture_texture_->UpdateFrame((uint8_t*)mapped.pData, desc.Width, desc.Height, mapped.RowPitch);
-    }
-    
-    local_context->Unmap(local_staging.Get(), 0);
 }

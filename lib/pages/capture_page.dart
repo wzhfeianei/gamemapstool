@@ -153,6 +153,7 @@ class _CapturePageState extends State<CapturePage> {
       if (!mounted) {
         return;
       }
+      debugPrint('Refresh process list error: ${e.toString()}');
       setState(() {
         _errorMessage = e.message ?? '获取进程列表失败';
       });
