@@ -32,7 +32,7 @@ class CaptureTexture {
 
   int64_t id() const { return texture_id_; }
 
-  void UpdateFrame(const uint8_t* data, size_t width, size_t height, size_t row_pitch);
+  void UpdateFrame(const uint8_t* data, size_t width, size_t height, size_t row_pitch, bool force_opaque = false);
 
   const FlutterDesktopPixelBuffer* CopyPixelBuffer(size_t width, size_t height);
 
@@ -96,6 +96,11 @@ class FlutterWindow : public Win32Window {
   std::mutex frame_mutex_;
   bool is_capturing_ = false;
   winrt::event_token frame_arrived_token_;
+
+  // GDI Capture
+  std::atomic<bool> gdi_capturing_ = false;
+  std::thread gdi_capture_thread_;
+  void GdiCaptureLoop(HWND hwnd, std::string mode);
 
   void StartCaptureSession(const flutter::MethodCall<flutter::EncodableValue>& call,
                            std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> result);

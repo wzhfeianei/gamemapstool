@@ -245,7 +245,8 @@ class _CapturePageState extends State<CapturePage> {
         'mode': _selectedCaptureMode,
       });
 
-      if (_selectedCaptureMode == 'wgc') {
+      // Try to get texture ID for all modes as they all support it now
+      try {
         final Map<Object?, Object?>? result = await _channel
             .invokeMapMethod<Object?, Object?>('getTextureId');
         if (result != null) {
@@ -260,6 +261,9 @@ class _CapturePageState extends State<CapturePage> {
             });
           }
         }
+      } catch (e) {
+        debugPrint('Failed to get texture ID: $e');
+        // Fallback to manual loop if texture is not available
       }
 
       _captureLoop();

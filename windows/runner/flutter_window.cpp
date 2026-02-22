@@ -8,6 +8,7 @@
 #include <unordered_map>
 #include <string>
 #include <vector>
+#include <chrono>
 
 #include <d3d11.h>
 #include <dxgi1_2.h>
@@ -47,7 +48,7 @@ CaptureTexture::~CaptureTexture() {
   texture_registrar_->UnregisterTexture(texture_id_);
 }
 
-void CaptureTexture::UpdateFrame(const uint8_t* data, size_t width, size_t height, size_t row_pitch) {
+void CaptureTexture::UpdateFrame(const uint8_t* data, size_t width, size_t height, size_t row_pitch, bool force_opaque) {
   const std::lock_guard<std::mutex> lock(mutex_);
   
   if (width_ != width || height_ != height) {
@@ -63,13 +64,29 @@ void CaptureTexture::UpdateFrame(const uint8_t* data, size_t width, size_t heigh
 
   if (buffer_.size() != width * height * 4) return;
 
-  // Copy with stride handling. 
-  // Source is BGRA (from D3D11), Destination is BGRA (Flutter standard on Windows).
+  // Copy with stride handling and color swizzling (BGRA -> RGBA)
+  // Source is BGRA (from D3D11), Destination is RGBA (Flutter standard on Windows).
+  // Note: Flutter's PixelBufferTexture on Windows expects RGBA by default if we can't specify otherwise.
   if (row_pitch == width * 4) {
-      memcpy(buffer_.data(), data, buffer_.size());
+      uint8_t* dst = buffer_.data();
+      const uint8_t* src = data;
+      size_t total_pixels = width * height;
+      for (size_t i = 0; i < total_pixels; ++i) {
+          dst[i * 4 + 0] = src[i * 4 + 2]; // R
+          dst[i * 4 + 1] = src[i * 4 + 1]; // G
+          dst[i * 4 + 2] = src[i * 4 + 0]; // B
+          dst[i * 4 + 3] = force_opaque ? 255 : src[i * 4 + 3]; // A
+      }
   } else {
       for (size_t y = 0; y < height; ++y) {
-          memcpy(buffer_.data() + y * width * 4, data + y * row_pitch, width * 4);
+          uint8_t* dst_row = buffer_.data() + y * width * 4;
+          const uint8_t* src_row = data + y * row_pitch;
+          for (size_t x = 0; x < width; ++x) {
+              dst_row[x * 4 + 0] = src_row[x * 4 + 2]; // R
+              dst_row[x * 4 + 1] = src_row[x * 4 + 1]; // G
+              dst_row[x * 4 + 2] = src_row[x * 4 + 0]; // B
+              dst_row[x * 4 + 3] = force_opaque ? 255 : src_row[x * 4 + 3]; // A
+          }
       }
   }
 
@@ -230,6 +247,8 @@ bool QueryProcessTime(DWORD pid, ULONGLONG* time) {
 
 std::unordered_map<DWORD, ULONGLONG> CaptureProcessTimes() {
   std::unordered_map<DWORD, ULONGLONG> times;
+
+
   const std::vector<ProcessRecord> records = EnumerateProcesses();
   for (const auto& record : records) {
     ULONGLONG value = 0;
@@ -901,7 +920,18 @@ bool CaptureWindowToPngBytes(HWND hwnd, std::vector<uint8_t>* output,
     return false;
   }
   HGDIOBJ old_object = SelectObject(hdc_mem, bitmap);
-  BOOL ok = PrintWindow(hwnd, hdc_mem, 0x00000002);
+  // Manual capture: Prefer PrintWindow as it handles most windows better (including partially obscured ones)
+  // Fallback to BitBlt if PrintWindow fails, then to WGC.
+  BOOL ok = PrintWindow(hwnd, hdc_mem, 0x00000002); // PW_CLIENTONLY | PW_RENDERFULLCONTENT
+  if (!ok) {
+      // Try standard PrintWindow
+      ok = PrintWindow(hwnd, hdc_mem, 0);
+  }
+  if (!ok) {
+      // Try BitBlt as last resort for GDI
+      ok = BitBlt(hdc_mem, 0, 0, width, height, hdc_window, 0, 0, SRCCOPY | CAPTUREBLT);
+  }
+
   if (!ok) {
     SelectObject(hdc_mem, old_object);
     ReleaseDC(hwnd, hdc_window);
@@ -980,7 +1010,9 @@ bool CaptureWindowToPngBytesPrintWindow(HWND hwnd, std::vector<uint8_t>* output,
 FlutterWindow::FlutterWindow(const flutter::DartProject& project)
     : project_(project) {}
 
-FlutterWindow::~FlutterWindow() {}
+FlutterWindow::~FlutterWindow() {
+  // StopCaptureSession(nullptr);
+}
 
 bool FlutterWindow::OnCreate() {
   if (!Win32Window::OnCreate()) {
@@ -999,16 +1031,24 @@ bool FlutterWindow::OnCreate() {
   }
   RegisterPlugins(flutter_controller_->engine());
   
-  auto registrar_ref = flutter_controller_->engine()->GetRegistrarForPlugin("gamemapstool_internal");
-  plugin_registrar_ = std::make_unique<flutter::PluginRegistrarWindows>(registrar_ref);
+  try {
+      auto registrar_ref = flutter_controller_->engine()->GetRegistrarForPlugin("gamemapstool_internal");
+      plugin_registrar_ = std::make_unique<flutter::PluginRegistrarWindows>(registrar_ref);
 
-  capture_texture_ = std::make_unique<CaptureTexture>(
-      plugin_registrar_->texture_registrar());
+      capture_texture_ = std::make_unique<CaptureTexture>(
+          plugin_registrar_->texture_registrar());
 
-  capture_channel_ = std::make_unique<
-      flutter::MethodChannel<flutter::EncodableValue>>(
-      flutter_controller_->engine()->messenger(), "gamemapstool/capture",
-      &flutter::StandardMethodCodec::GetInstance());
+      capture_channel_ = std::make_unique<
+          flutter::MethodChannel<flutter::EncodableValue>>(
+          flutter_controller_->engine()->messenger(), "gamemapstool/capture",
+          &flutter::StandardMethodCodec::GetInstance());
+  } catch (const std::exception& e) {
+      std::cerr << "Exception in OnCreate setup: " << e.what() << std::endl;
+      return false;
+  } catch (...) {
+      std::cerr << "Unknown exception in OnCreate setup" << std::endl;
+      return false;
+  }
   capture_channel_->SetMethodCallHandler(
       [this](const flutter::MethodCall<flutter::EncodableValue>& call,
              std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>>
@@ -1027,6 +1067,10 @@ bool FlutterWindow::OnCreate() {
         }
         if (call.method_name() == "getCaptureFrame") {
           GetCaptureFrame(call, std::move(result));
+          return;
+        }
+        if (call.method_name() == "getLastFrame") {
+          GetLastFrame(std::move(result));
           return;
         }
         if (call.method_name() == "listProcesses") {
@@ -1076,10 +1120,10 @@ bool FlutterWindow::OnCreate() {
         std::string capture_mode = "auto";
         auto mode_it = args->find(flutter::EncodableValue("mode"));
         if (mode_it != args->end() &&
-            std::holds_alternative<std::string>(mode_it->second)) {
-          capture_mode = std::get<std::string>(mode_it->second);
-        }
-        if (!has_pid) {
+      std::holds_alternative<std::string>(mode_it->second)) {
+    capture_mode = std::get<std::string>(mode_it->second);
+  }
+  if (!has_pid) {
           auto process_it = args->find(flutter::EncodableValue("processName"));
           if (process_it == args->end() ||
               !std::holds_alternative<std::string>(process_it->second)) {
@@ -1118,10 +1162,10 @@ bool FlutterWindow::OnCreate() {
         std::vector<uint8_t> png_bytes;
         std::wstring error;
         bool captured = false;
-        if (capture_mode == "printWindow") {
-          captured = CaptureWindowToPngBytesPrintWindow(hwnd, &png_bytes, &error);
-        } else if (capture_mode == "wgc") {
+        if (capture_mode == "wgc") {
           captured = CaptureWindowToPngBytesWgc(hwnd, &png_bytes, &error);
+        } else if (capture_mode == "printWindow") {
+          captured = CaptureWindowToPngBytesPrintWindow(hwnd, &png_bytes, &error);
         } else {
           captured = CaptureWindowToPngBytes(hwnd, &png_bytes, &error);
         }
@@ -1177,6 +1221,106 @@ FlutterWindow::MessageHandler(HWND hwnd, UINT const message,
   return Win32Window::MessageHandler(hwnd, message, wparam, lparam);
 }
 
+void FlutterWindow::GdiCaptureLoop(HWND hwnd, std::string mode) {
+  // 1. Initial setup
+  HDC hdc_window = GetDC(hwnd);
+  if (!hdc_window) {
+      // Fallback if we can't get DC
+      return;
+  }
+  HDC hdc_mem = CreateCompatibleDC(hdc_window);
+  HBITMAP hbitmap = nullptr;
+  HGDIOBJ old_object = nullptr;
+  void* bits = nullptr;
+  std::vector<uint8_t> buffer;
+  int last_width = 0;
+  int last_height = 0;
+
+  // Common BMI for 32-bit RGB
+  BITMAPINFO bmi = {};
+  bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+  bmi.bmiHeader.biPlanes = 1;
+  bmi.bmiHeader.biBitCount = 32;
+  bmi.bmiHeader.biCompression = BI_RGB;
+
+  while (gdi_capturing_) {
+    auto start_time = std::chrono::steady_clock::now();
+
+    // 2. Check window validity
+    if (!IsWindow(hwnd) || !IsWindowVisible(hwnd)) {
+       std::this_thread::sleep_for(std::chrono::milliseconds(100));
+       continue;
+    }
+
+    // 3. Get Window Size
+    RECT rect;
+    if (!GetClientRect(hwnd, &rect)) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        continue;
+    }
+    int width = rect.right - rect.left;
+    int height = rect.bottom - rect.top;
+
+    if (width <= 0 || height <= 0) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        continue;
+    }
+
+    // 4. Recreate bitmap if size changed or first run
+    if (!hbitmap || width != last_width || height != last_height) {
+        if (old_object) SelectObject(hdc_mem, old_object);
+        if (hbitmap) DeleteObject(hbitmap);
+
+        bmi.bmiHeader.biWidth = width;
+        bmi.bmiHeader.biHeight = -height; // Top-down
+
+        // Always use DIB Section for direct access and best performance
+        // This avoids GetDIBits overhead and potential failure points
+        hbitmap = CreateDIBSection(hdc_mem, &bmi, DIB_RGB_COLORS, &bits, nullptr, 0);
+
+        if (!hbitmap) {
+             std::this_thread::sleep_for(std::chrono::milliseconds(100));
+             continue;
+        }
+        old_object = SelectObject(hdc_mem, hbitmap);
+        last_width = width;
+        last_height = height;
+    }
+
+    // 5. Perform Capture
+    bool success = false;
+    if (mode == "bitblt") {
+        success = BitBlt(hdc_mem, 0, 0, width, height, hdc_window, 0, 0, SRCCOPY | CAPTUREBLT);
+    } else {
+        // PrintWindow with PW_CLIENTONLY | PW_RENDERFULLCONTENT (0x3)
+        success = PrintWindow(hwnd, hdc_mem, 0x3);
+        if (!success) {
+             success = PrintWindow(hwnd, hdc_mem, 0x2);
+        }
+    }
+
+    if (success && capture_texture_) {
+        // 6. Update Texture
+        // Direct access via bits pointer (DIB Section)
+        // Alpha channel is often 0 for GDI capture, so force_opaque=true is critical
+        capture_texture_->UpdateFrame(static_cast<uint8_t*>(bits), width, height, width * 4, true);
+    }
+
+    // 7. Frame pacing (Aim for ~30 FPS = 33ms)
+    auto end_time = std::chrono::steady_clock::now();
+    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time).count();
+    if (elapsed < 33) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(33 - elapsed));
+    }
+  }
+
+  // 8. Cleanup
+  if (old_object) SelectObject(hdc_mem, old_object);
+  if (hbitmap) DeleteObject(hbitmap);
+  if (hdc_mem) DeleteDC(hdc_mem);
+  if (hdc_window) ReleaseDC(hwnd, hdc_window);
+}
+
 void FlutterWindow::StartCaptureSession(
     const flutter::MethodCall<flutter::EncodableValue>& call,
     std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> result) {
@@ -1207,6 +1351,12 @@ void FlutterWindow::StartCaptureSession(
        process_name = Utf8ToWide(std::get<std::string>(process_it->second));
     }
   }
+
+  std::string capture_mode = "wgc";
+  auto mode_it = args->find(flutter::EncodableValue("mode"));
+  if (mode_it != args->end() && std::holds_alternative<std::string>(mode_it->second)) {
+      capture_mode = std::get<std::string>(mode_it->second);
+  }
   
   const std::vector<ProcessRecord> records = EnumerateProcesses();
   const auto children_map = BuildProcessChildrenMap(records);
@@ -1229,6 +1379,13 @@ void FlutterWindow::StartCaptureSession(
   }
 
   StopCaptureSession(nullptr);
+
+  if (capture_mode != "wgc") {
+      gdi_capturing_ = true;
+      gdi_capture_thread_ = std::thread(&FlutterWindow::GdiCaptureLoop, this, hwnd, capture_mode);
+      result->Success();
+      return;
+  }
 
   HRESULT hr = D3D11CreateDevice(
       nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
@@ -1302,6 +1459,13 @@ void FlutterWindow::StartCaptureSession(
 }
 
 void FlutterWindow::StopCaptureSession(std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> result) {
+  if (gdi_capturing_) {
+    gdi_capturing_ = false;
+    if (gdi_capture_thread_.joinable()) {
+      gdi_capture_thread_.join();
+    }
+  }
+
   {
     std::lock_guard<std::mutex> lock(frame_mutex_);
     is_capturing_ = false;
@@ -1337,7 +1501,7 @@ void FlutterWindow::GetCaptureFrame(const flutter::MethodCall<flutter::Encodable
            ComPtr<IWICBitmap> wic_bitmap;
            hr = factory->CreateBitmapFromMemory(
                static_cast<UINT>(width), static_cast<UINT>(height),
-               GUID_WICPixelFormat32bppBGRA,
+               GUID_WICPixelFormat32bppRGBA,
                static_cast<UINT>(width * 4),
                static_cast<UINT>(buffer.size()),
                buffer.data(),
@@ -1449,7 +1613,7 @@ void FlutterWindow::GetLastFrame(std::unique_ptr<flutter::MethodResult<flutter::
   ComPtr<IWICBitmap> wic_bitmap;
   hr = factory->CreateBitmapFromMemory(
       static_cast<UINT>(width), static_cast<UINT>(height),
-      GUID_WICPixelFormat32bppBGRA,
+      GUID_WICPixelFormat32bppRGBA,
       static_cast<UINT>(width * 4),
       static_cast<UINT>(buffer.size()),
       buffer.data(),
