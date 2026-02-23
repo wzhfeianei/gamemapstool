@@ -59,7 +59,6 @@ class _CapturePageState extends State<CapturePage> {
   Timer? _autoTimer;
   bool _autoEnabled = false;
   bool _captureInProgress = false;
-  int _intervalMs = 1000;
   int? _textureId;
   double? _textureWidth;
   double? _textureHeight;
@@ -443,7 +442,7 @@ class _CapturePageState extends State<CapturePage> {
             '分辨率：${_textureWidth?.toInt() ?? 0}x${_textureHeight?.toInt() ?? 0} 用时：${_lastCaptureDurationMs ?? 0} ms';
       } else if (_imageWidth != null && _imageHeight != null) {
         statusText =
-            '分辨率：${_imageWidth}x${_imageHeight} 用时：${_lastCaptureDurationMs ?? 0} ms';
+            '分辨率：$_imageWidth×$_imageHeight 用时：${_lastCaptureDurationMs ?? 0} ms';
       } else {
         statusText = '用时：${_lastCaptureDurationMs ?? 0} ms';
       }
