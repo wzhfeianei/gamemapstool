@@ -79,8 +79,11 @@ class FlutterWindow : public Win32Window {
   int next_capture_id_ = 1;
   std::map<int, std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>>>
       pending_results_;
+  std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> pending_start_result_;
+  std::string pending_start_error_;
 
   // WGC Session State
+  HWND current_capture_hwnd_ = nullptr;
   winrt::Windows::Graphics::Capture::GraphicsCaptureSession session_{nullptr};
   winrt::Windows::Graphics::Capture::Direct3D11CaptureFramePool frame_pool_{nullptr};
   winrt::Windows::Graphics::DirectX::Direct3D11::IDirect3DDevice device_{nullptr};
@@ -112,6 +115,16 @@ class FlutterWindow : public Win32Window {
                       winrt::Windows::Foundation::IInspectable const& args);
 
   std::unique_ptr<CaptureTexture> capture_texture_;
+
+  // Task synchronization
+  std::atomic<bool> start_task_running_ = false;
+
+  // Cached window rects for cropping
+  std::chrono::steady_clock::time_point last_rect_update_ = {};
+  UINT cached_client_width_ = 0;
+  UINT cached_client_height_ = 0;
+  UINT cached_offset_x_ = 0;
+  UINT cached_offset_y_ = 0;
 };
 
 #endif  // RUNNER_FLUTTER_WINDOW_H_

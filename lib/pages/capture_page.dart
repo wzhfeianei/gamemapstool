@@ -1,8 +1,7 @@
 import 'dart:async';
-import 'dart:math';
+import 'dart:ui' as ui;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
-import 'package:gamemapstool/pages/settings_page.dart';
 
 class CapturePage extends StatefulWidget {
   const CapturePage({super.key});
@@ -16,15 +15,15 @@ class ProcessEntry {
     required this.pid,
     required this.name,
     this.windowTitle,
-    required this.cpu,
     required this.iconBytes,
+    this.cpu = 0.0,
   });
 
   final int pid;
   final String name;
   final String? windowTitle;
-  final double cpu;
   final Uint8List? iconBytes;
+  final double cpu;
 
   @override
   bool operator ==(Object other) {
@@ -44,13 +43,14 @@ class _CapturePageState extends State<CapturePage> {
   List<ProcessEntry> _processList = [];
   ProcessEntry? _selectedProcess;
   bool _processLoading = false;
+  bool _isBusy = false; // Prevents re-entry during async ops
   int _imageVersion = 0;
   final List<Map<String, String>> _captureModes = [
     <String, String>{'value': 'bitblt', 'label': 'BitBlt'},
     <String, String>{'value': 'printWindow', 'label': 'PrintWindow'},
     <String, String>{'value': 'wgc', 'label': 'Graphics Capture'},
   ];
-  String _selectedCaptureMode = 'bitblt';
+  String _selectedCaptureMode = 'wgc';
 
   Uint8List? _imageBytes;
   String? _errorMessage;
@@ -59,13 +59,11 @@ class _CapturePageState extends State<CapturePage> {
   Timer? _autoTimer;
   bool _autoEnabled = false;
   bool _captureInProgress = false;
-  int _intervalMs = 1000;
-  int _rotationQuarterTurns = 0;
-  bool _flipHorizontal = false;
-  bool _grayscale = false;
   int? _textureId;
   double? _textureWidth;
   double? _textureHeight;
+  int? _imageWidth;
+  int? _imageHeight;
 
   @override
   void initState() {
@@ -102,8 +100,8 @@ class _CapturePageState extends State<CapturePage> {
         final Object? pidValue = item['pid'];
         final Object? nameValue = item['name'];
         final Object? windowTitleValue = item['windowTitle'];
-        final Object? cpuValue = item['cpu'];
         final Object? iconValue = item['icon'];
+        final Object? cpuValue = item['cpu'];
         final int pid = pidValue is int
             ? pidValue
             : pidValue is num
@@ -116,20 +114,20 @@ class _CapturePageState extends State<CapturePage> {
             windowTitleValue is String && windowTitleValue.isNotEmpty
             ? windowTitleValue
             : null;
+        final Uint8List? icon = iconValue is Uint8List ? iconValue : null;
         final double cpu = cpuValue is double
             ? cpuValue
             : cpuValue is num
             ? cpuValue.toDouble()
             : 0.0;
-        final Uint8List? icon = iconValue is Uint8List ? iconValue : null;
         if (pid > 0 && name.isNotEmpty) {
           processes.add(
             ProcessEntry(
               pid: pid,
               name: name,
               windowTitle: windowTitle,
-              cpu: cpu,
               iconBytes: icon,
+              cpu: cpu,
             ),
           );
         }
@@ -202,8 +200,19 @@ class _CapturePageState extends State<CapturePage> {
         _imageVersion++;
         if (bytes == null || bytes.isEmpty) {
           _errorMessage = '未获取到截图数据';
+          _imageWidth = null;
+          _imageHeight = null;
         }
       });
+      if (bytes != null && bytes.isNotEmpty) {
+        final ui.Image image = await decodeImageFromList(bytes);
+        if (mounted) {
+          setState(() {
+            _imageWidth = image.width;
+            _imageHeight = image.height;
+          });
+        }
+      }
     } on PlatformException catch (e) {
       stopwatch.stop();
       if (!mounted) {
@@ -223,7 +232,7 @@ class _CapturePageState extends State<CapturePage> {
   }
 
   Future<void> _startAutoCapture() async {
-    if (_autoEnabled) {
+    if (_autoEnabled || _isBusy) {
       return;
     }
     final ProcessEntry? process = _selectedProcess;
@@ -235,7 +244,7 @@ class _CapturePageState extends State<CapturePage> {
     }
 
     setState(() {
-      _autoEnabled = true;
+      _isBusy = true;
       _errorMessage = null;
     });
 
@@ -244,6 +253,11 @@ class _CapturePageState extends State<CapturePage> {
         'pid': process.pid,
         'processName': process.name,
         'mode': _selectedCaptureMode,
+      });
+
+      if (!mounted) return;
+      setState(() {
+        _autoEnabled = true;
       });
 
       // Try to get texture ID for all modes as they all support it now
@@ -267,6 +281,7 @@ class _CapturePageState extends State<CapturePage> {
         // Fallback to manual loop if texture is not available
       }
 
+      // Start the loop without awaiting it, as it runs indefinitely until stopped
       _captureLoop();
     } on PlatformException catch (e) {
       if (!mounted) return;
@@ -274,6 +289,12 @@ class _CapturePageState extends State<CapturePage> {
         _autoEnabled = false;
         _errorMessage = e.message ?? '启动捕获会话失败';
       });
+    } finally {
+      if (mounted) {
+        setState(() {
+          _isBusy = false;
+        });
+      }
     }
   }
 
@@ -281,108 +302,70 @@ class _CapturePageState extends State<CapturePage> {
     if (!_autoEnabled) return;
     if (_textureId != null) return;
 
-    final Stopwatch stopwatch = Stopwatch()..start();
+    // Retry getting texture ID instead of falling back to slow PNG capture
     try {
-      final Uint8List? bytes = await _channel.invokeMethod<Uint8List>(
-        'getCaptureFrame',
-      );
-      stopwatch.stop();
-
-      if (!mounted || !_autoEnabled) return;
-
-      if (bytes != null && bytes.isNotEmpty) {
-        setState(() {
-          _imageBytes = bytes;
-          _lastCapturedAt = DateTime.now();
-          _lastCaptureDurationMs = stopwatch.elapsedMilliseconds;
-          _imageVersion++;
-        });
-      }
-    } catch (e) {
-      debugPrint('Capture frame error: $e');
-    }
-
-    // Schedule next frame immediately for real-time performance
-    if (_autoEnabled) {
-      // Use a small delay if needed, or 0 for max speed.
-      // Using Future.delayed(Duration.zero) to allow UI thread to breathe.
-      int delayMs = _intervalMs > 0 ? _intervalMs : 33; // Default to ~30 FPS
-      if (delayMs < 16) delayMs = 16; // Cap at ~60 FPS
-      Future.delayed(Duration(milliseconds: delayMs), _captureLoop);
-    }
-  }
-
-  Future<void> _stopAutoCapture() async {
-    try {
-      if (_textureId != null) {
-        final Uint8List? lastFrame = await _channel.invokeMethod(
-          'getLastFrame',
-        );
-        if (lastFrame != null && mounted) {
-          setState(() {
-            _imageBytes = lastFrame;
-          });
+      final Map<Object?, Object?>? result = await _channel
+          .invokeMapMethod<Object?, Object?>('getTextureId');
+      if (result != null) {
+        final int? tid = result['id'] as int?;
+        final int? w = result['width'] as int?;
+        final int? h = result['height'] as int?;
+        if (tid != null) {
+          if (mounted) {
+            setState(() {
+              _textureId = tid;
+              _textureWidth = w?.toDouble();
+              _textureHeight = h?.toDouble();
+            });
+          }
+          return; // Exit loop, texture is ready
         }
       }
     } catch (e) {
-      debugPrint('Get last frame error: $e');
+      // debugPrint('Retry getTextureId failed: $e');
     }
 
-    if (!mounted) return;
+    if (!mounted || !_autoEnabled) return;
+
+    // Wait before retrying
+    Future<void>.delayed(const Duration(milliseconds: 500), _captureLoop);
+  }
+
+  Future<void> _stopAutoCapture() async {
+    if (_isBusy) return;
     setState(() {
-      _autoEnabled = false;
-      _textureId = null;
+      _isBusy = true;
     });
+
     try {
+      // Try to get one last frame before stopping
+      if (_textureId != null) {
+        try {
+          final Uint8List? lastFrame = await _channel.invokeMethod(
+            'getLastFrame',
+          );
+          if (lastFrame != null && mounted) {
+            setState(() {
+              _imageBytes = lastFrame;
+            });
+          }
+        } catch (e) {
+          // Ignore last frame error
+        }
+      }
+
       await _channel.invokeMethod('stopCaptureSession');
     } catch (e) {
       debugPrint('Stop capture session error: $e');
+    } finally {
+      if (mounted) {
+        setState(() {
+          _autoEnabled = false;
+          _textureId = null;
+          _isBusy = false;
+        });
+      }
     }
-  }
-
-  void _updateInterval(int value) {
-    setState(() {
-      _intervalMs = value;
-    });
-    if (_autoEnabled) {
-      _startAutoCapture();
-    }
-  }
-
-  void _resetImageOps() {
-    setState(() {
-      _rotationQuarterTurns = 0;
-      _flipHorizontal = false;
-      _grayscale = false;
-    });
-  }
-
-  ColorFilter? _buildColorFilter() {
-    if (!_grayscale) {
-      return null;
-    }
-    return const ColorFilter.matrix(<double>[
-      0.2126,
-      0.7152,
-      0.0722,
-      0,
-      0,
-      0.2126,
-      0.7152,
-      0.0722,
-      0,
-      0,
-      0.2126,
-      0.7152,
-      0.0722,
-      0,
-      0,
-      0,
-      0,
-      0,
-      1,
-      0,
-    ]);
   }
 
   Widget _buildImagePreview() {
@@ -391,23 +374,14 @@ class _CapturePageState extends State<CapturePage> {
       if (_textureWidth != null &&
           _textureHeight != null &&
           _textureHeight! > 0) {
-        image = AspectRatio(
-          aspectRatio: _textureWidth! / _textureHeight!,
+        image = SizedBox(
+          width: _textureWidth,
+          height: _textureHeight,
           child: image,
         );
       }
-      final ColorFilter? filter = _buildColorFilter();
-      if (filter != null) {
-        image = ColorFiltered(colorFilter: filter, child: image);
-      }
-      image = Transform(
-        alignment: Alignment.center,
-        transform: Matrix4.identity()
-          ..rotateZ(_rotationQuarterTurns * (pi / 2))
-          ..scale(_flipHorizontal ? -1.0 : 1.0, 1.0, 1.0),
-        child: image,
-      );
       return InteractiveViewer(
+        constrained: false,
         minScale: 0.2,
         maxScale: 5,
         child: Center(child: image),
@@ -420,24 +394,14 @@ class _CapturePageState extends State<CapturePage> {
         child: const Text('暂无截图'),
       );
     }
-    final ColorFilter? filter = _buildColorFilter();
     Widget image = Image.memory(
       _imageBytes!,
       key: ValueKey<int>(_imageVersion),
       gaplessPlayback: true,
-      fit: BoxFit.contain,
-    );
-    if (filter != null) {
-      image = ColorFiltered(colorFilter: filter, child: image);
-    }
-    image = Transform(
-      alignment: Alignment.center,
-      transform: Matrix4.identity()
-        ..rotateZ(_rotationQuarterTurns * (pi / 2))
-        ..scaleByDouble(_flipHorizontal ? -1.0 : 1.0, 1.0, 1.0, 1.0),
-      child: image,
+      fit: BoxFit.none,
     );
     return InteractiveViewer(
+      constrained: false,
       minScale: 0.2,
       maxScale: 5,
       child: Center(child: image),
@@ -453,23 +417,17 @@ class _CapturePageState extends State<CapturePage> {
         entry.windowTitle != null && entry.windowTitle!.isNotEmpty
         ? '${entry.windowTitle} ${entry.name}'
         : entry.name;
-    final String cpuText = 'CPU: ${entry.cpu.toStringAsFixed(1)}%';
 
     return Row(
       children: [
         icon,
         const SizedBox(width: 8),
-        Flexible(
+        Expanded(
           child: Text(
-            displayName,
+            '$displayName [CPU: ${entry.cpu.toStringAsFixed(1)}%]',
             overflow: TextOverflow.ellipsis,
             style: const TextStyle(fontWeight: FontWeight.w500),
           ),
-        ),
-        const SizedBox(width: 8),
-        Text(
-          cpuText,
-          style: TextStyle(fontSize: 12, color: Colors.grey.shade600),
         ),
       ],
     );
@@ -477,11 +435,20 @@ class _CapturePageState extends State<CapturePage> {
 
   @override
   Widget build(BuildContext context) {
-    final String statusText = _lastCapturedAt == null
-        ? '尚未截图'
-        : '最近截图：${_lastCapturedAt!.toLocal().toIso8601String()} 用时：${_lastCaptureDurationMs ?? 0} ms';
+    String statusText = '尚未截图';
+    if (_lastCapturedAt != null) {
+      if (_textureId != null) {
+        statusText =
+            '分辨率：${_textureWidth?.toInt() ?? 0}x${_textureHeight?.toInt() ?? 0} 用时：${_lastCaptureDurationMs ?? 0} ms';
+      } else if (_imageWidth != null && _imageHeight != null) {
+        statusText =
+            '分辨率：$_imageWidth×$_imageHeight 用时：${_lastCaptureDurationMs ?? 0} ms';
+      } else {
+        statusText = '用时：${_lastCaptureDurationMs ?? 0} ms';
+      }
+    }
+
     return Scaffold(
-      appBar: AppBar(title: const Text('游戏截图工具')),
       body: Padding(
         padding: const EdgeInsets.all(16),
         child: Column(
@@ -496,12 +463,27 @@ class _CapturePageState extends State<CapturePage> {
                       initialValue: _selectedProcess,
                       isExpanded: true,
                       isDense: true,
-                      decoration: const InputDecoration(
+                      decoration: InputDecoration(
                         labelText: '进程',
-                        border: OutlineInputBorder(),
-                        contentPadding: EdgeInsets.symmetric(
+                        border: const OutlineInputBorder(),
+                        contentPadding: const EdgeInsets.symmetric(
                           horizontal: 10,
                           vertical: 8,
+                        ),
+                        suffixIcon: IconButton(
+                          icon: _processLoading
+                              ? const SizedBox(
+                                  width: 24,
+                                  height: 24,
+                                  child: CircularProgressIndicator(
+                                    strokeWidth: 2,
+                                  ),
+                                )
+                              : const Icon(Icons.refresh),
+                          onPressed: _processLoading
+                              ? null
+                              : _refreshProcessList,
+                          tooltip: '刷新进程列表',
                         ),
                       ),
                       items: _processList
@@ -560,98 +542,42 @@ class _CapturePageState extends State<CapturePage> {
                   ),
                 ),
                 const SizedBox(width: 12),
-                OutlinedButton.icon(
-                  onPressed: _processLoading ? null : _refreshProcessList,
-                  icon: const Icon(Icons.refresh),
-                  label: Text(_processLoading ? '刷新中' : '刷新'),
-                ),
-                const SizedBox(width: 12),
-                OutlinedButton.icon(
-                  onPressed: () async {
-                    final int? updatedInterval = await Navigator.of(context)
-                        .push(
-                          MaterialPageRoute<int>(
-                            builder: (BuildContext context) =>
-                                SettingsPage(intervalMs: _intervalMs),
-                          ),
-                        );
-                    if (updatedInterval != null) {
-                      _updateInterval(updatedInterval);
-                    }
-                  },
-                  icon: const Icon(Icons.settings),
-                  label: const Text('配置'),
-                ),
-              ],
-            ),
-            const SizedBox(height: 12),
-            Row(
-              children: [
                 ElevatedButton(
                   onPressed: _captureInProgress ? null : _captureOnce,
                   child: Text(_captureInProgress ? '截图中...' : '手动截图'),
                 ),
                 const SizedBox(width: 12),
-                FilledButton(
-                  onPressed: _autoEnabled
-                      ? _stopAutoCapture
-                      : _startAutoCapture,
-                  child: Text(_autoEnabled ? '停止实时捕获' : '开始实时捕获'),
+                SizedBox(
+                  width: 140,
+                  height: 40,
+                  child: FilledButton(
+                    onPressed: _isBusy
+                        ? null
+                        : (_autoEnabled ? _stopAutoCapture : _startAutoCapture),
+                    child: Stack(
+                      alignment: Alignment.center,
+                      children: [
+                        Opacity(
+                          opacity: _isBusy ? 0 : 1,
+                          child: Text(_autoEnabled ? '停止实时捕获' : '开始实时捕获'),
+                        ),
+                        if (_isBusy)
+                          const SizedBox(
+                            width: 20,
+                            height: 20,
+                            child: CircularProgressIndicator(
+                              strokeWidth: 2,
+                              color: Colors.white,
+                            ),
+                          ),
+                      ],
+                    ),
+                  ),
                 ),
-                const SizedBox(width: 12),
-                OutlinedButton(
-                  onPressed: () {
-                    setState(() {
-                      _imageBytes = null;
-                      _errorMessage = null;
-                      _lastCapturedAt = null;
-                    });
-                  },
-                  child: const Text('清除图片'),
-                ),
-                const Spacer(),
-                Text(statusText),
               ],
             ),
             const SizedBox(height: 12),
-            Wrap(
-              spacing: 12,
-              runSpacing: 8,
-              children: [
-                OutlinedButton.icon(
-                  onPressed: () {
-                    setState(() {
-                      _rotationQuarterTurns = (_rotationQuarterTurns + 1) % 4;
-                    });
-                  },
-                  icon: const Icon(Icons.rotate_right),
-                  label: const Text('旋转90°'),
-                ),
-                OutlinedButton.icon(
-                  onPressed: () {
-                    setState(() {
-                      _flipHorizontal = !_flipHorizontal;
-                    });
-                  },
-                  icon: const Icon(Icons.flip),
-                  label: Text(_flipHorizontal ? '取消水平翻转' : '水平翻转'),
-                ),
-                OutlinedButton.icon(
-                  onPressed: () {
-                    setState(() {
-                      _grayscale = !_grayscale;
-                    });
-                  },
-                  icon: const Icon(Icons.filter_b_and_w),
-                  label: Text(_grayscale ? '取消灰度' : '灰度'),
-                ),
-                OutlinedButton.icon(
-                  onPressed: _resetImageOps,
-                  icon: const Icon(Icons.restart_alt),
-                  label: const Text('重置操作'),
-                ),
-              ],
-            ),
+            Row(children: [Expanded(child: Text(statusText))]),
             if (_errorMessage != null) ...[
               const SizedBox(height: 8),
               Align(
