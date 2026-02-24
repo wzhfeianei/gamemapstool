@@ -1255,6 +1255,15 @@ void FlutterWindow::StartCaptureSession(
 
   // Spawn a thread to perform the setup asynchronously
   std::thread([this, target_pid, has_pid, process_name]() {
+    // Initialize COM/WinRT in the background thread
+    bool apartment_initialized = false;
+    try {
+        winrt::init_apartment(winrt::apartment_type::multi_threaded);
+        apartment_initialized = true;
+    } catch (...) {
+        // COM might be already initialized, which is fine
+    }
+
     try {
       // 1. Stop previous session (this might block joining threads)
       StopCaptureSession(nullptr);
@@ -1342,6 +1351,10 @@ void FlutterWindow::StartCaptureSession(
     } catch (...) {
       pending_start_error_ = "Unknown error during capture setup";
       PostMessage(GetHandle(), WM_CAPTURE_COMPLETE, 0, 0);
+    }
+
+    if (apartment_initialized) {
+        winrt::uninit_apartment();
     }
   }).detach();
 }
