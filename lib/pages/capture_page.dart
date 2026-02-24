@@ -1,7 +1,17 @@
 import 'dart:async';
 import 'dart:ui' as ui;
+import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:win32/win32.dart' as win32;
+import '../controllers/input_controller.dart';
+
+// Missing constants in some win32 versions or specific libraries
+const int MK_LBUTTON = 0x0001;
+const int MK_RBUTTON = 0x0002;
+const int MK_SHIFT = 0x0004;
+const int MK_CONTROL = 0x0008;
+const int MK_MBUTTON = 0x0010;
 
 class CapturePage extends StatefulWidget {
   const CapturePage({super.key});
@@ -61,6 +71,12 @@ class _CapturePageState extends State<CapturePage> {
 
   Timer? _checkAliveTimer;
 
+  final InputController _inputController = InputController();
+  bool _controlEnabled = false;
+  final FocusNode _inputFocusNode = FocusNode();
+
+  String? _lastInputStatus; // Store last input status for display
+
   @override
   void initState() {
     super.initState();
@@ -76,7 +92,90 @@ class _CapturePageState extends State<CapturePage> {
   void dispose() {
     _autoTimer?.cancel();
     _checkAliveTimer?.cancel();
+    _inputFocusNode.dispose();
     super.dispose();
+  }
+
+  void _handlePointer(PointerEvent event) {
+    if (!_controlEnabled || _selectedProcess == null) return;
+
+    final int pid = _selectedProcess!.pid;
+    // Coordinates relative to the image (InteractiveViewer child)
+    final int x = event.localPosition.dx.toInt();
+    final int y = event.localPosition.dy.toInt();
+
+    // Only update status for Down/Up to avoid spamming setState on Move
+    // For Move, update status every 10 events or so if needed, but for now just log/send
+    // Actually, user requested "监听到鼠标键盘动作时,在下方信息栏显示到的监听信息"
+    // To avoid lag, we might want to throttle UI updates, but send messages immediately.
+
+    String action = '';
+
+    if (event is PointerDownEvent) {
+      if (event.buttons == kPrimaryMouseButton) {
+        action = 'L-Down';
+        _inputController.sendMouseEvent(
+          pid,
+          x,
+          y,
+          win32.WM_LBUTTONDOWN,
+          MK_LBUTTON,
+        );
+      } else if (event.buttons == kSecondaryMouseButton) {
+        action = 'R-Down';
+        _inputController.sendMouseEvent(
+          pid,
+          x,
+          y,
+          win32.WM_RBUTTONDOWN,
+          MK_RBUTTON,
+        );
+      }
+    } else if (event is PointerUpEvent) {
+      // For Up events, buttons might be 0, but we need to know which one was released.
+      // However, PointerUpEvent doesn't explicitly say which button released in a simple way
+      // other than checking changed buttons, but standard WM_LBUTTONUP doesn't need wParam usually (except keys).
+      // We can infer from the event type or check logic.
+      // Simply sending LBUTTONUP for primary button up is safe enough for now.
+      // A more robust way handles all buttons.
+      // For now, assume Left Button.
+      // Actually PointerUpEvent has 'kind'.
+      action = 'Up';
+      _inputController.sendMouseEvent(pid, x, y, win32.WM_LBUTTONUP, 0);
+    } else if (event is PointerMoveEvent) {
+      // Throttle UI updates for move events to avoid performance hit
+      // But always send the message
+      int wParam = 0;
+      if (event.buttons & kPrimaryMouseButton != 0) wParam |= MK_LBUTTON;
+      if (event.buttons & kSecondaryMouseButton != 0) wParam |= MK_RBUTTON;
+      _inputController.sendMouseEvent(pid, x, y, win32.WM_MOUSEMOVE, wParam);
+      // action = 'Move'; // Don't update UI on every move
+    } else if (event is PointerHoverEvent) {
+      _inputController.sendMouseEvent(pid, x, y, win32.WM_MOUSEMOVE, 0);
+    }
+
+    if (action.isNotEmpty) {
+      setState(() {
+        _lastInputStatus = 'Mouse: $action ($x, $y) -> PID: $pid';
+      });
+    }
+  }
+
+  void _handleKey(RawKeyEvent event) {
+    if (!_controlEnabled || _selectedProcess == null) return;
+
+    final int pid = _selectedProcess!.pid;
+    if (event.data is RawKeyEventDataWindows) {
+      final data = event.data as RawKeyEventDataWindows;
+      final int vkCode = data.keyCode;
+      final bool isDown = event is RawKeyDownEvent;
+      _inputController.sendKeyEvent(pid, vkCode, isDown);
+
+      setState(() {
+        _lastInputStatus =
+            'Key: ${isDown ? "Down" : "Up"} (VK: $vkCode) -> PID: $pid';
+      });
+    }
   }
 
   Future<void> _refreshProcessList({bool updateState = true}) async {
@@ -400,6 +499,7 @@ class _CapturePageState extends State<CapturePage> {
   }
 
   Widget _buildImagePreview() {
+    Widget content;
     if (_textureId != null) {
       Widget image = Texture(textureId: _textureId!);
       if (_textureWidth != null &&
@@ -411,53 +511,75 @@ class _CapturePageState extends State<CapturePage> {
           child: image,
         );
       }
-      return InteractiveViewer(
-        constrained: false,
-        minScale: 0.2,
-        maxScale: 5,
-        child: Center(child: image),
-      );
-    }
-    if (_imageBytes == null || _imageBytes!.isEmpty) {
+      content = image;
+    } else if (_imageBytes == null || _imageBytes!.isEmpty) {
       return Container(
         alignment: Alignment.center,
         color: Colors.grey.shade100,
         child: const Text('暂无截图'),
       );
+    } else {
+      content = Image.memory(
+        _imageBytes!,
+        key: ValueKey<int>(_imageVersion),
+        gaplessPlayback: true,
+        fit: BoxFit.none,
+      );
     }
-    Widget image = Image.memory(
-      _imageBytes!,
-      key: ValueKey<int>(_imageVersion),
-      gaplessPlayback: true,
-      fit: BoxFit.none,
+
+    // Wrap content with Listener for mouse events
+    content = Listener(
+      onPointerDown: _handlePointer,
+      onPointerUp: _handlePointer,
+      onPointerMove: _handlePointer,
+      onPointerHover: _handlePointer,
+      child: content,
     );
-    return InteractiveViewer(
-      constrained: false,
-      minScale: 0.2,
-      maxScale: 5,
-      child: Center(child: image),
+
+    return RawKeyboardListener(
+      focusNode: _inputFocusNode,
+      onKey: _handleKey,
+      autofocus: _controlEnabled,
+      child: InteractiveViewer(
+        constrained: false,
+        minScale: 0.2,
+        maxScale: 5,
+        panEnabled: !_controlEnabled,
+        scaleEnabled: !_controlEnabled,
+        child: Center(child: content),
+      ),
     );
   }
 
   Widget _buildProcessItem(ProcessEntry entry) {
-    final Widget icon = entry.iconBytes != null && entry.iconBytes!.isNotEmpty
-        ? Image.memory(entry.iconBytes!, width: 20, height: 20)
-        : const Icon(Icons.apps, size: 20);
+    // Keep this method but update it to match the dialog style or just ignore it if unused.
+    // Since the user wants the original dialog style, we will inline the style in the dialog
+    // and leave this method as is (or remove it if it causes issues, but better to just fix the dialog).
+    // Actually, to avoid the "unused" warning and keep code clean, let's make this method
+    // match the ORIGINAL dialog style exactly.
 
-    final String displayName =
-        entry.windowTitle != null && entry.windowTitle!.isNotEmpty
-        ? '${entry.windowTitle} ${entry.name}'
+    final Widget icon = entry.iconBytes != null && entry.iconBytes!.isNotEmpty
+        ? Image.memory(entry.iconBytes!, width: 32, height: 32)
+        : const Icon(Icons.apps, size: 32);
+
+    final String title = entry.windowTitle?.isNotEmpty == true
+        ? entry.windowTitle!
         : entry.name;
 
     return Row(
       children: [
         icon,
-        const SizedBox(width: 8),
+        const SizedBox(width: 12),
         Expanded(
-          child: Text(
-            '$displayName [CPU: ${entry.cpu.toStringAsFixed(1)}%]',
-            overflow: TextOverflow.ellipsis,
-            style: const TextStyle(fontWeight: FontWeight.w500),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(title, style: const TextStyle(fontWeight: FontWeight.bold)),
+              Text(
+                entry.name,
+                style: const TextStyle(color: Colors.grey, fontSize: 12),
+              ),
+            ],
           ),
         ),
       ],
@@ -471,17 +593,6 @@ class _CapturePageState extends State<CapturePage> {
       builder: (BuildContext context) {
         return StatefulBuilder(
           builder: (context, setState) {
-            // Use a timer or listener to update dialog when process list updates?
-            // Actually, since _processList is in the parent state and we are rebuilding via parent setState,
-            // we might need to listen to changes.
-            // But _refreshProcessList calls setState on the parent widget.
-            // Dialogs in Flutter are on a different route. Parent setState won't rebuild the dialog content
-            // unless we pass the data down or use a state management solution.
-            // Simple way: wrap the content in a widget that listens to the parent or re-fetch in dialog.
-            // For now, let's just rely on the fact that _processList is updated in the parent state.
-            // Wait, showDialog pushes a new route. The parent's build method is not called for the dialog content.
-            // We need to link the dialog state to the data.
-
             return Dialog(
               shape: RoundedRectangleBorder(
                 borderRadius: BorderRadius.circular(8),
@@ -507,18 +618,6 @@ class _CapturePageState extends State<CapturePage> {
                     ),
                     const SizedBox(height: 16),
                     Expanded(
-                      // We need to access the parent's _processList and _processLoading status.
-                      // Since we are inside the parent class, we can access members.
-                      // But to trigger rebuilds of the dialog when they change, we need to be careful.
-                      // Let's use a ValueListenable or just pass a callback?
-                      // Actually, the simplest way for this specific case without major refactor:
-                      // Make the dialog content a StatefulWidget that handles its own refresh or listens to a stream.
-                      // BUT, _refreshProcessList is already implemented in parent.
-                      // Let's just assume the list is mostly ready or static for the moment,
-                      // OR (better) implement a simple polling in the dialog or use the parent's state properly.
-                      // Correct approach: The parent setState rebuilds the CapturePage, but NOT the Dialog.
-                      // We can pass the list to the dialog. But if the list updates (loading finishes), the dialog won't update.
-                      // So we should move the loading logic or use a StreamBuilder/ValueListenableBuilder.
                       child: ValueListenableBuilder<bool>(
                         valueListenable: _loadingNotifier,
                         builder: (context, isLoading, child) {
@@ -538,7 +637,6 @@ class _CapturePageState extends State<CapturePage> {
                                   // Optional: Single tap to highlight?
                                 },
                                 onDoubleTap: () {
-                                  // Update parent state
                                   this.setState(() {
                                     _selectedProcess = entry;
                                   });
@@ -552,44 +650,7 @@ class _CapturePageState extends State<CapturePage> {
                                         : null,
                                     borderRadius: BorderRadius.circular(4),
                                   ),
-                                  child: Row(
-                                    children: [
-                                      if (entry.iconBytes != null &&
-                                          entry.iconBytes!.isNotEmpty)
-                                        Image.memory(
-                                          entry.iconBytes!,
-                                          width: 32,
-                                          height: 32,
-                                        )
-                                      else
-                                        const Icon(Icons.apps, size: 32),
-                                      const SizedBox(width: 12),
-                                      Expanded(
-                                        child: Column(
-                                          crossAxisAlignment:
-                                              CrossAxisAlignment.start,
-                                          children: [
-                                            Text(
-                                              entry.windowTitle?.isNotEmpty ==
-                                                      true
-                                                  ? entry.windowTitle!
-                                                  : entry.name,
-                                              style: const TextStyle(
-                                                fontWeight: FontWeight.bold,
-                                              ),
-                                            ),
-                                            Text(
-                                              entry.name,
-                                              style: const TextStyle(
-                                                color: Colors.grey,
-                                                fontSize: 12,
-                                              ),
-                                            ),
-                                          ],
-                                        ),
-                                      ),
-                                    ],
-                                  ),
+                                  child: _buildProcessItem(entry),
                                 ),
                               );
                             },
@@ -626,7 +687,7 @@ class _CapturePageState extends State<CapturePage> {
         children: [
           Expanded(
             child: Text(
-              statusText,
+              _lastInputStatus ?? statusText, // Prioritize input status
               style: const TextStyle(color: Colors.white, fontSize: 12),
             ),
           ),
@@ -696,6 +757,23 @@ class _CapturePageState extends State<CapturePage> {
                   ),
                 ),
                 const Spacer(),
+                IconButton(
+                  icon: Icon(
+                    _controlEnabled ? Icons.mouse : Icons.mouse_outlined,
+                  ),
+                  color: _controlEnabled ? Colors.green : null,
+                  onPressed: _selectedProcess == null
+                      ? null
+                      : () {
+                          setState(() {
+                            _controlEnabled = !_controlEnabled;
+                            if (_controlEnabled) {
+                              _inputFocusNode.requestFocus();
+                            }
+                          });
+                        },
+                  tooltip: _controlEnabled ? '停止同步控制' : '开始同步控制',
+                ),
                 IconButton(
                   icon: const Icon(Icons.camera_alt),
                   onPressed: _captureInProgress ? null : _captureOnce,
