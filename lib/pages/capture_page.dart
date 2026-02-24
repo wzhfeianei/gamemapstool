@@ -84,13 +84,13 @@ class _CapturePageState extends State<CapturePage> {
       return;
     }
     if (updateState) {
-        setState(() {
+      setState(() {
         _processLoading = true;
         _loadingNotifier.value = true;
         _errorMessage = null;
-        });
+      });
     } else {
-        _processLoading = true;
+      _processLoading = true;
     }
 
     try {
@@ -155,7 +155,7 @@ class _CapturePageState extends State<CapturePage> {
           }
         }
       }
-      
+
       if (!updateState && selectedPid != null && found) {
         // Background check passed, process is alive.
         // Do NOT update _selectedProcess to avoid icon flickering.
@@ -166,13 +166,13 @@ class _CapturePageState extends State<CapturePage> {
         _processList = processes;
         // Check alive logic
         if (selectedPid != null) {
-            if (found) {
-                // Update with latest info (e.g. CPU usage)
-                _selectedProcess = nextSelected;
-            } else {
-                // Process died
-                _selectedProcess = null;
-            }
+          if (found) {
+            // Update with latest info (e.g. CPU usage)
+            _selectedProcess = nextSelected;
+          } else {
+            // Process died
+            _selectedProcess = null;
+          }
         }
       });
     } on PlatformException catch (e) {
@@ -181,20 +181,20 @@ class _CapturePageState extends State<CapturePage> {
       }
       // Only show error if explicitly refreshing
       if (updateState) {
-          debugPrint('Refresh process list error: ${e.toString()}');
-          setState(() {
-            _errorMessage = e.message ?? '获取进程列表失败';
-          });
+        debugPrint('Refresh process list error: ${e.toString()}');
+        setState(() {
+          _errorMessage = e.message ?? '获取进程列表失败';
+        });
       }
     } finally {
       if (mounted) {
         if (updateState) {
-            setState(() {
+          setState(() {
             _processLoading = false;
             _loadingNotifier.value = false;
-            });
+          });
         } else {
-            _processLoading = false;
+          _processLoading = false;
         }
       }
     }
@@ -617,6 +617,24 @@ class _CapturePageState extends State<CapturePage> {
 
   final ValueNotifier<bool> _loadingNotifier = ValueNotifier(false);
 
+  Widget _buildStatusBar(String statusText) {
+    return Container(
+      height: 24,
+      padding: const EdgeInsets.symmetric(horizontal: 8),
+      decoration: BoxDecoration(color: Theme.of(context).primaryColor),
+      child: Row(
+        children: [
+          Expanded(
+            child: Text(
+              statusText,
+              style: const TextStyle(color: Colors.white, fontSize: 12),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     String statusText = '尚未截图';
@@ -657,7 +675,11 @@ class _CapturePageState extends State<CapturePage> {
                     child: Row(
                       children: [
                         if (_selectedProcess?.iconBytes != null)
-                          Image.memory(_selectedProcess!.iconBytes!, width: 20, height: 20)
+                          Image.memory(
+                            _selectedProcess!.iconBytes!,
+                            width: 20,
+                            height: 20,
+                          )
                         else
                           const Icon(Icons.add_to_queue, size: 20),
                         const SizedBox(width: 8),
@@ -691,39 +713,38 @@ class _CapturePageState extends State<CapturePage> {
             ),
           ),
 
+          // Image Preview Area
           Expanded(
-            child: Padding(
-              padding: const EdgeInsets.all(16),
-              child: Column(
-                children: [
-                  Row(children: [Expanded(child: Text(statusText))]),
-                  if (_errorMessage != null) ...[
-                    const SizedBox(height: 8),
-                    Align(
-                      alignment: Alignment.centerLeft,
+            child: Stack(
+              children: [
+                Container(
+                  color: Colors.black87,
+                  width: double.infinity,
+                  child: _buildImagePreview(),
+                ),
+                if (_errorMessage != null)
+                  Positioned(
+                    top: 16,
+                    left: 16,
+                    right: 16,
+                    child: Container(
+                      padding: const EdgeInsets.all(8),
+                      decoration: BoxDecoration(
+                        color: Colors.red.withOpacity(0.8),
+                        borderRadius: BorderRadius.circular(4),
+                      ),
                       child: Text(
                         _errorMessage!,
-                        style: TextStyle(
-                          color: Theme.of(context).colorScheme.error,
-                        ),
+                        style: const TextStyle(color: Colors.white),
                       ),
-                    ),
-                  ],
-                  const SizedBox(height: 12),
-                  Expanded(
-                    child: Container(
-                      width: double.infinity,
-                      decoration: BoxDecoration(
-                        border: Border.all(color: Colors.grey.shade300),
-                        borderRadius: BorderRadius.circular(8),
-                      ),
-                      child: _buildImagePreview(),
                     ),
                   ),
-                ],
-              ),
+              ],
             ),
           ),
+
+          // Status Bar
+          _buildStatusBar(statusText),
         ],
       ),
     );
