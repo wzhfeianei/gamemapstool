@@ -45,12 +45,6 @@ class _CapturePageState extends State<CapturePage> {
   bool _processLoading = false;
   bool _isBusy = false; // Prevents re-entry during async ops
   int _imageVersion = 0;
-  final List<Map<String, String>> _captureModes = [
-    <String, String>{'value': 'bitblt', 'label': 'BitBlt'},
-    <String, String>{'value': 'printWindow', 'label': 'PrintWindow'},
-    <String, String>{'value': 'wgc', 'label': 'Graphics Capture'},
-  ];
-  String _selectedCaptureMode = 'wgc';
 
   Uint8List? _imageBytes;
   String? _errorMessage;
@@ -183,11 +177,7 @@ class _CapturePageState extends State<CapturePage> {
     try {
       final Uint8List? bytes = await _channel.invokeMethod<Uint8List>(
         'capture',
-        <String, Object?>{
-          'pid': process.pid,
-          'processName': process.name,
-          'mode': _selectedCaptureMode,
-        },
+        <String, Object?>{'pid': process.pid, 'processName': process.name},
       );
       stopwatch.stop();
       if (!mounted) {
@@ -252,7 +242,6 @@ class _CapturePageState extends State<CapturePage> {
       await _channel.invokeMethod('startCaptureSession', <String, Object?>{
         'pid': process.pid,
         'processName': process.name,
-        'mode': _selectedCaptureMode,
       });
 
       if (!mounted) return;
@@ -501,44 +490,6 @@ class _CapturePageState extends State<CapturePage> {
                         });
                       },
                     ),
-                  ),
-                ),
-                const SizedBox(width: 12),
-                SizedBox(
-                  width: 140,
-                  height: 40,
-                  child: DropdownButtonFormField<String>(
-                    initialValue: _selectedCaptureMode,
-                    isExpanded: true,
-                    isDense: true,
-                    decoration: const InputDecoration(
-                      labelText: '截图方式',
-                      border: OutlineInputBorder(),
-                      contentPadding: EdgeInsets.symmetric(
-                        horizontal: 10,
-                        vertical: 8,
-                      ),
-                    ),
-                    items: _captureModes
-                        .map(
-                          (Map<String, String> mode) =>
-                              DropdownMenuItem<String>(
-                                value: mode['value'],
-                                child: Text(
-                                  mode['label'] ?? '',
-                                  overflow: TextOverflow.ellipsis,
-                                ),
-                              ),
-                        )
-                        .toList(),
-                    onChanged: (String? value) {
-                      if (value == null) {
-                        return;
-                      }
-                      setState(() {
-                        _selectedCaptureMode = value;
-                      });
-                    },
                   ),
                 ),
                 const SizedBox(width: 12),

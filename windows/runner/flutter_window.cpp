@@ -939,132 +939,6 @@ bool CaptureWindowToPngBytesWgc(HWND hwnd, std::vector<uint8_t>* output,
   }
   return ok;
 }
-
-bool CaptureWindowToPngBytes(HWND hwnd, std::vector<uint8_t>* output,
-                             std::wstring* error) {
-  RECT rect;
-  if (!GetClientRect(hwnd, &rect)) {
-    if (error) {
-      *error = L"Failed to get window size";
-    }
-    return false;
-  }
-  const int width = rect.right - rect.left;
-  const int height = rect.bottom - rect.top;
-  if (width <= 0 || height <= 0) {
-    if (error) {
-      *error = L"Invalid window size";
-    }
-    return false;
-  }
-  HDC hdc_window = GetDC(hwnd);
-  if (!hdc_window) {
-    if (error) {
-      *error = L"Failed to get window DC";
-    }
-    return false;
-  }
-  HDC hdc_mem = CreateCompatibleDC(hdc_window);
-  HBITMAP bitmap = CreateCompatibleBitmap(hdc_window, width, height);
-  if (!hdc_mem || !bitmap) {
-    if (error) {
-      *error = L"Failed to create bitmap";
-    }
-    if (bitmap) {
-      DeleteObject(bitmap);
-    }
-    if (hdc_mem) {
-      DeleteDC(hdc_mem);
-    }
-    ReleaseDC(hwnd, hdc_window);
-    return false;
-  }
-  HGDIOBJ old_object = SelectObject(hdc_mem, bitmap);
-  // Manual capture: Prefer PrintWindow as it handles most windows better (including partially obscured ones)
-  // Fallback to BitBlt if PrintWindow fails, then to WGC.
-  BOOL ok = PrintWindow(hwnd, hdc_mem, 0x00000003); // PW_CLIENTONLY | PW_RENDERFULLCONTENT
-  if (!ok) {
-      // Try standard PrintWindow
-      ok = PrintWindow(hwnd, hdc_mem, 0x00000001); // PW_CLIENTONLY
-  }
-  if (!ok) {
-      // Try BitBlt as last resort for GDI
-      ok = BitBlt(hdc_mem, 0, 0, width, height, hdc_window, 0, 0, SRCCOPY | CAPTUREBLT);
-  }
-
-  if (!ok) {
-    SelectObject(hdc_mem, old_object);
-    ReleaseDC(hwnd, hdc_window);
-    DeleteObject(bitmap);
-    DeleteDC(hdc_mem);
-    return CaptureWindowToPngBytesWgc(hwnd, output, error);
-  }
-  SelectObject(hdc_mem, old_object);
-  ReleaseDC(hwnd, hdc_window);
-  const bool encoded = EncodeBitmapToPng(bitmap, output, error);
-  DeleteObject(bitmap);
-  DeleteDC(hdc_mem);
-  return encoded;
-}
-
-bool CaptureWindowToPngBytesPrintWindow(HWND hwnd, std::vector<uint8_t>* output,
-                                        std::wstring* error) {
-  RECT rect;
-  if (!GetClientRect(hwnd, &rect)) {
-    if (error) {
-      *error = L"Failed to get window size";
-    }
-    return false;
-  }
-  const int width = rect.right - rect.left;
-  const int height = rect.bottom - rect.top;
-  if (width <= 0 || height <= 0) {
-    if (error) {
-      *error = L"Invalid window size";
-    }
-    return false;
-  }
-  HDC hdc_window = GetDC(hwnd);
-  if (!hdc_window) {
-    if (error) {
-      *error = L"Failed to get window DC";
-    }
-    return false;
-  }
-  HDC hdc_mem = CreateCompatibleDC(hdc_window);
-  HBITMAP bitmap = CreateCompatibleBitmap(hdc_window, width, height);
-  if (!hdc_mem || !bitmap) {
-    if (error) {
-      *error = L"Failed to create bitmap";
-    }
-    if (bitmap) {
-      DeleteObject(bitmap);
-    }
-    if (hdc_mem) {
-      DeleteDC(hdc_mem);
-    }
-    ReleaseDC(hwnd, hdc_window);
-    return false;
-  }
-  HGDIOBJ old_object = SelectObject(hdc_mem, bitmap);
-  BOOL ok = PrintWindow(hwnd, hdc_mem, 0x00000003); // PW_CLIENTONLY | PW_RENDERFULLCONTENT
-  if (!ok) {
-    SelectObject(hdc_mem, old_object);
-    ReleaseDC(hwnd, hdc_window);
-    DeleteObject(bitmap);
-    DeleteDC(hdc_mem);
-    if (error) {
-      *error = L"PrintWindow failed";
-    }
-    return false;
-  }
-  SelectObject(hdc_mem, old_object);
-  ReleaseDC(hwnd, hdc_window);
-  const bool encoded = EncodeBitmapToPng(bitmap, output, error);
-  DeleteObject(bitmap);
-  DeleteDC(hdc_mem);
-  return encoded;
-}
 }  
 
 FlutterWindow::FlutterWindow(const flutter::DartProject& project)
@@ -1177,13 +1051,7 @@ bool FlutterWindow::OnCreate() {
           }
         }
         std::wstring process_name;
-        std::string capture_mode = "auto";
-        auto mode_it = args->find(flutter::EncodableValue("mode"));
-        if (mode_it != args->end() &&
-      std::holds_alternative<std::string>(mode_it->second)) {
-    capture_mode = std::get<std::string>(mode_it->second);
-  }
-  if (!has_pid) {
+        if (!has_pid) {
           auto process_it = args->find(flutter::EncodableValue("processName"));
           if (process_it == args->end() ||
               !std::holds_alternative<std::string>(process_it->second)) {
@@ -1221,14 +1089,8 @@ bool FlutterWindow::OnCreate() {
         }
         std::vector<uint8_t> png_bytes;
         std::wstring error;
-        bool captured = false;
-        if (capture_mode == "wgc") {
-          captured = CaptureWindowToPngBytesWgc(hwnd, &png_bytes, &error);
-        } else if (capture_mode == "printWindow") {
-          captured = CaptureWindowToPngBytesPrintWindow(hwnd, &png_bytes, &error);
-        } else {
-          captured = CaptureWindowToPngBytes(hwnd, &png_bytes, &error);
-        }
+        bool captured = CaptureWindowToPngBytesWgc(hwnd, &png_bytes, &error);
+        
         if (!captured) {
           result->Error("capture-failed",
                         error.empty() ? "Capture failed" : WideToUtf8(error));
@@ -1292,111 +1154,6 @@ FlutterWindow::MessageHandler(HWND hwnd, UINT const message,
   return Win32Window::MessageHandler(hwnd, message, wparam, lparam);
 }
 
-void FlutterWindow::GdiCaptureLoop(HWND hwnd, std::string mode) {
-  // 1. Initial setup
-  HDC hdc_window = GetDC(hwnd);
-  if (!hdc_window) {
-      // Fallback if we can't get DC
-      return;
-  }
-  HDC hdc_mem = CreateCompatibleDC(hdc_window);
-  HBITMAP hbitmap = nullptr;
-  HGDIOBJ old_object = nullptr;
-  void* bits = nullptr;
-  std::vector<uint8_t> buffer;
-  int last_width = 0;
-  int last_height = 0;
-
-  // Common BMI for 32-bit RGB
-  BITMAPINFO bmi = {};
-  bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-  bmi.bmiHeader.biPlanes = 1;
-  bmi.bmiHeader.biBitCount = 32;
-  bmi.bmiHeader.biCompression = BI_RGB;
-
-  while (gdi_capturing_) {
-    try {
-      auto start_time = std::chrono::steady_clock::now();
-
-      // 2. Check window validity
-      if (!IsWindow(hwnd) || !IsWindowVisible(hwnd)) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
-        continue;
-      }
-
-      // 3. Get Window Size
-      RECT rect;
-      if (!GetClientRect(hwnd, &rect)) {
-          std::this_thread::sleep_for(std::chrono::milliseconds(100));
-          continue;
-      }
-      int width = rect.right - rect.left;
-      int height = rect.bottom - rect.top;
-
-      if (width <= 0 || height <= 0) {
-          std::this_thread::sleep_for(std::chrono::milliseconds(100));
-          continue;
-      }
-
-      // 4. Recreate bitmap if size changed or first run
-      if (!hbitmap || width != last_width || height != last_height) {
-          if (old_object) SelectObject(hdc_mem, old_object);
-          if (hbitmap) DeleteObject(hbitmap);
-
-          bmi.bmiHeader.biWidth = width;
-          bmi.bmiHeader.biHeight = -height; // Top-down
-
-          // Always use DIB Section for direct access and best performance
-          // This avoids GetDIBits overhead and potential failure points
-          hbitmap = CreateDIBSection(hdc_mem, &bmi, DIB_RGB_COLORS, &bits, nullptr, 0);
-
-          if (!hbitmap) {
-              std::this_thread::sleep_for(std::chrono::milliseconds(100));
-              continue;
-          }
-          old_object = SelectObject(hdc_mem, hbitmap);
-          last_width = width;
-          last_height = height;
-      }
-
-      // 5. Perform Capture
-      bool success = false;
-      if (mode == "bitblt") {
-          success = BitBlt(hdc_mem, 0, 0, width, height, hdc_window, 0, 0, SRCCOPY | CAPTUREBLT);
-      } else {
-          // PrintWindow with PW_CLIENTONLY | PW_RENDERFULLCONTENT (0x3)
-          success = PrintWindow(hwnd, hdc_mem, 0x3);
-          if (!success) {
-              success = PrintWindow(hwnd, hdc_mem, 0x2);
-          }
-      }
-
-      if (success && capture_texture_) {
-          // 6. Update Texture
-          // Direct access via bits pointer (DIB Section)
-          // Alpha channel is often 0 for GDI capture, so force_opaque=true is critical
-          capture_texture_->UpdateFrame(static_cast<uint8_t*>(bits), width, height, width * 4, true);
-      }
-
-      // 7. Frame pacing (Aim for ~30 FPS = 33ms)
-      auto end_time = std::chrono::steady_clock::now();
-      auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time).count();
-      if (elapsed < 33) {
-          std::this_thread::sleep_for(std::chrono::milliseconds(33 - elapsed));
-      }
-    } catch (...) {
-      // Prevent thread crash, just sleep and retry
-      std::this_thread::sleep_for(std::chrono::milliseconds(100));
-    }
-  }
-
-  // 8. Cleanup
-  if (old_object) SelectObject(hdc_mem, old_object);
-  if (hbitmap) DeleteObject(hbitmap);
-  if (hdc_mem) DeleteDC(hdc_mem);
-  if (hdc_window) ReleaseDC(hwnd, hdc_window);
-}
-
 void FlutterWindow::StartCaptureSession(
     const flutter::MethodCall<flutter::EncodableValue>& call,
     std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> result) {
@@ -1428,12 +1185,6 @@ void FlutterWindow::StartCaptureSession(
     }
   }
 
-  std::string capture_mode = "wgc";
-  auto mode_it = args->find(flutter::EncodableValue("mode"));
-  if (mode_it != args->end() && std::holds_alternative<std::string>(mode_it->second)) {
-      capture_mode = std::get<std::string>(mode_it->second);
-  }
-  
   if (start_task_running_) {
     result->Error("busy", "Capture session is starting");
     return;
@@ -1445,7 +1196,7 @@ void FlutterWindow::StartCaptureSession(
   pending_start_error_.clear();
 
   // Spawn a thread to perform the setup asynchronously
-  std::thread([this, target_pid, has_pid, process_name, capture_mode]() {
+  std::thread([this, target_pid, has_pid, process_name]() {
     try {
       // 1. Stop previous session (this might block joining threads)
       StopCaptureSession(nullptr);
@@ -1471,62 +1222,57 @@ void FlutterWindow::StartCaptureSession(
       }
 
       // 3. Start Capture
-      if (capture_mode != "wgc") {
-          gdi_capturing_ = true;
-          gdi_capture_thread_ = std::thread(&FlutterWindow::GdiCaptureLoop, this, hwnd, capture_mode);
-      } else {
-          HRESULT hr = D3D11CreateDevice(
-              nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
-              nullptr, 0, D3D11_SDK_VERSION, &d3d11_device_, nullptr, &d3d11_context_);
-          
-          if (FAILED(hr)) throw std::runtime_error("Failed to create D3D device");
+      HRESULT hr = D3D11CreateDevice(
+          nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+          nullptr, 0, D3D11_SDK_VERSION, &d3d11_device_, nullptr, &d3d11_context_);
+      
+      if (FAILED(hr)) throw std::runtime_error("Failed to create D3D device");
 
-          ComPtr<IDXGIDevice> dxgi_device;
-          hr = d3d11_device_.As(&dxgi_device);
-          if (FAILED(hr)) throw std::runtime_error("Failed to get DXGI device");
+      ComPtr<IDXGIDevice> dxgi_device;
+      hr = d3d11_device_.As(&dxgi_device);
+      if (FAILED(hr)) throw std::runtime_error("Failed to get DXGI device");
 
-          winrt::com_ptr<IInspectable> inspectable_device;
-          hr = CreateDirect3D11DeviceFromDXGIDevice(dxgi_device.Get(), inspectable_device.put());
-          if (FAILED(hr)) throw std::runtime_error("Failed to create WinRT device");
+      winrt::com_ptr<IInspectable> inspectable_device;
+      hr = CreateDirect3D11DeviceFromDXGIDevice(dxgi_device.Get(), inspectable_device.put());
+      if (FAILED(hr)) throw std::runtime_error("Failed to create WinRT device");
 
-          device_ = inspectable_device.as<winrt::Windows::Graphics::DirectX::Direct3D11::IDirect3DDevice>();
+      device_ = inspectable_device.as<winrt::Windows::Graphics::DirectX::Direct3D11::IDirect3DDevice>();
 
-          auto interop = winrt::get_activation_factory<
-              winrt::Windows::Graphics::Capture::GraphicsCaptureItem,
-              IGraphicsCaptureItemInterop>();
+      auto interop = winrt::get_activation_factory<
+          winrt::Windows::Graphics::Capture::GraphicsCaptureItem,
+          IGraphicsCaptureItemInterop>();
 
-          hr = interop->CreateForWindow(
-              hwnd,
-              winrt::guid_of<winrt::Windows::Graphics::Capture::IGraphicsCaptureItem>(),
-              winrt::put_abi(item_));
+      hr = interop->CreateForWindow(
+          hwnd,
+          winrt::guid_of<winrt::Windows::Graphics::Capture::IGraphicsCaptureItem>(),
+          winrt::put_abi(item_));
 
-          if (FAILED(hr) || !item_) throw std::runtime_error("Failed to create capture item");
+      if (FAILED(hr) || !item_) throw std::runtime_error("Failed to create capture item");
 
-          auto size = item_.Size();
+      auto size = item_.Size();
 
-          try {
-            frame_pool_ = winrt::Windows::Graphics::Capture::Direct3D11CaptureFramePool::CreateFreeThreaded(
-                device_,
-                winrt::Windows::Graphics::DirectX::DirectXPixelFormat::B8G8R8A8UIntNormalized,
-                1, size);
-          } catch (...) {
-             frame_pool_ = winrt::Windows::Graphics::Capture::Direct3D11CaptureFramePool::Create(
-                device_,
-                winrt::Windows::Graphics::DirectX::DirectXPixelFormat::B8G8R8A8UIntNormalized,
-                1, size);
-          }
+      try {
+        frame_pool_ = winrt::Windows::Graphics::Capture::Direct3D11CaptureFramePool::CreateFreeThreaded(
+            device_,
+            winrt::Windows::Graphics::DirectX::DirectXPixelFormat::B8G8R8A8UIntNormalized,
+            1, size);
+      } catch (...) {
+          frame_pool_ = winrt::Windows::Graphics::Capture::Direct3D11CaptureFramePool::Create(
+            device_,
+            winrt::Windows::Graphics::DirectX::DirectXPixelFormat::B8G8R8A8UIntNormalized,
+            1, size);
+      }
 
-          session_ = frame_pool_.CreateCaptureSession(item_);
-          session_.IsCursorCaptureEnabled(false);
+      session_ = frame_pool_.CreateCaptureSession(item_);
+      session_.IsCursorCaptureEnabled(false);
 
-          frame_arrived_token_ = frame_pool_.FrameArrived({this, &FlutterWindow::OnFrameArrived});
+      frame_arrived_token_ = frame_pool_.FrameArrived({this, &FlutterWindow::OnFrameArrived});
 
-          current_capture_hwnd_ = hwnd;
-          session_.StartCapture();
-          {
-              std::lock_guard<std::mutex> lock(frame_mutex_);
-              is_capturing_ = true;
-          }
+      current_capture_hwnd_ = hwnd;
+      session_.StartCapture();
+      {
+          std::lock_guard<std::mutex> lock(frame_mutex_);
+          is_capturing_ = true;
       }
 
       // Success
@@ -1543,13 +1289,6 @@ void FlutterWindow::StartCaptureSession(
 }
 
 void FlutterWindow::StopCaptureSession(std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> result) {
-  if (gdi_capturing_) {
-    gdi_capturing_ = false;
-    if (gdi_capture_thread_.joinable()) {
-      gdi_capture_thread_.join();
-    }
-  }
-
   {
     std::lock_guard<std::mutex> lock(frame_mutex_);
     is_capturing_ = false;
@@ -1643,12 +1382,6 @@ void FlutterWindow::GetCaptureFrame(const flutter::MethodCall<flutter::Encodable
       return;
   }
   
-  // Try GDI capture as fallback
-  if (CaptureWindowToPngBytes(hwnd, &png_bytes, &error)) {
-      result->Success(flutter::EncodableValue(png_bytes));
-      return;
-  }
-
   // Convert wstring error to string (basic conversion)
   std::string error_str = Utf8FromUtf16(error.c_str());
   result->Error("capture_failed", error_str.empty() ? "Failed to capture window" : error_str);

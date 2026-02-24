@@ -43,5 +43,14 @@ app.*.map.json
 /android/app/debug
 /android/app/profile
 /android/app/release
-macos/Flutter/ephemeral/flutter_export_environment.sh
-macos/Flutter/ephemeral/Flutter-Generated.xcconfig
+# Flutter 各平台自动生成的Flutter依赖目录
+macos/Flutter/
+linux/flutter/
+# 建议同时忽略其他平台的对应目录（完整配置）
+ios/Flutter/
+windows/flutter/
+# 额外建议忽略的自动生成文件
+macos/Podfile.lock
+linux/flutter_export_environment.sh
+ios/Podfile.lock
+windows/flutter_export_environment.sh

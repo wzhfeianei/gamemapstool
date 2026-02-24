@@ -100,11 +100,6 @@ class FlutterWindow : public Win32Window {
   bool is_capturing_ = false;
   winrt::event_token frame_arrived_token_;
 
-  // GDI Capture
-  std::atomic<bool> gdi_capturing_ = false;
-  std::thread gdi_capture_thread_;
-  void GdiCaptureLoop(HWND hwnd, std::string mode);
-
   void StartCaptureSession(const flutter::MethodCall<flutter::EncodableValue>& call,
                            std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> result);
   void StopCaptureSession(std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> result);
