@@ -59,27 +59,40 @@ class _CapturePageState extends State<CapturePage> {
   int? _imageWidth;
   int? _imageHeight;
 
+  Timer? _checkAliveTimer;
+
   @override
   void initState() {
     super.initState();
     _refreshProcessList();
+    _checkAliveTimer = Timer.periodic(const Duration(seconds: 3), (timer) {
+      if (_selectedProcess != null) {
+        _refreshProcessList(updateState: false);
+      }
+    });
   }
 
   @override
   void dispose() {
     _autoTimer?.cancel();
+    _checkAliveTimer?.cancel();
     super.dispose();
   }
 
-  Future<void> _refreshProcessList() async {
+  Future<void> _refreshProcessList({bool updateState = true}) async {
     if (_processLoading) {
       return;
     }
-    setState(() {
-      _processLoading = true;
-      _loadingNotifier.value = true;
-      _errorMessage = null;
-    });
+    if (updateState) {
+        setState(() {
+        _processLoading = true;
+        _loadingNotifier.value = true;
+        _errorMessage = null;
+        });
+    } else {
+        _processLoading = true;
+    }
+
     try {
       final List<Object?>? result = await _channel.invokeMethod<List<Object?>>(
         'listProcesses',
@@ -127,35 +140,62 @@ class _CapturePageState extends State<CapturePage> {
           );
         }
       }
+
+      // If we have a selected process, check if it's still in the list
       final int? selectedPid = _selectedProcess?.pid;
       ProcessEntry? nextSelected;
+      bool found = false;
+
       if (selectedPid != null) {
         for (final ProcessEntry entry in processes) {
           if (entry.pid == selectedPid) {
             nextSelected = entry;
+            found = true;
             break;
           }
         }
       }
+      
+      if (!updateState && selectedPid != null && found) {
+        // Background check passed, process is alive.
+        // Do NOT update _selectedProcess to avoid icon flickering.
+        return;
+      }
+
       setState(() {
         _processList = processes;
-        _selectedProcess =
-            nextSelected ?? (processes.isNotEmpty ? processes.first : null);
+        // Check alive logic
+        if (selectedPid != null) {
+            if (found) {
+                // Update with latest info (e.g. CPU usage)
+                _selectedProcess = nextSelected;
+            } else {
+                // Process died
+                _selectedProcess = null;
+            }
+        }
       });
     } on PlatformException catch (e) {
       if (!mounted) {
         return;
       }
-      debugPrint('Refresh process list error: ${e.toString()}');
-      setState(() {
-        _errorMessage = e.message ?? '获取进程列表失败';
-      });
+      // Only show error if explicitly refreshing
+      if (updateState) {
+          debugPrint('Refresh process list error: ${e.toString()}');
+          setState(() {
+            _errorMessage = e.message ?? '获取进程列表失败';
+          });
+      }
     } finally {
       if (mounted) {
-        setState(() {
-          _processLoading = false;
-          _loadingNotifier.value = false;
-        });
+        if (updateState) {
+            setState(() {
+            _processLoading = false;
+            _loadingNotifier.value = false;
+            });
+        } else {
+            _processLoading = false;
+        }
       }
     }
   }
@@ -617,20 +657,14 @@ class _CapturePageState extends State<CapturePage> {
                     child: Row(
                       children: [
                         if (_selectedProcess?.iconBytes != null)
-                          Image.memory(
-                            _selectedProcess!.iconBytes!,
-                            width: 20,
-                            height: 20,
-                          )
+                          Image.memory(_selectedProcess!.iconBytes!, width: 20, height: 20)
                         else
-                          const Icon(Icons.window, size: 20),
+                          const Icon(Icons.add_to_queue, size: 20),
                         const SizedBox(width: 8),
                         ConstrainedBox(
                           constraints: const BoxConstraints(maxWidth: 200),
                           child: Text(
-                            _selectedProcess?.windowTitle ??
-                                _selectedProcess?.name ??
-                                '选择窗口',
+                            _selectedProcess != null ? '已绑定窗口' : '点击绑定窗口',
                             overflow: TextOverflow.ellipsis,
                           ),
                         ),
