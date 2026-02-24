@@ -112,12 +112,21 @@ class InputController {
     }
   }
 
+  // Constants that might be missing in some win32 versions or scopes
+  static const int WM_ACTIVATE = 0x0006;
+  static const int WA_ACTIVE = 1;
+  static const int WM_SETFOCUS = 0x0007;
+
   void sendMouseEvent(int pid, int x, int y, int msg, int wParam) {
     final hwnd = getHwndForPid(pid);
     if (hwnd == 0) {
       print('InputController: HWND not found for PID $pid');
       return;
     }
+
+    // Try to trick the window into thinking it's active
+    PostMessage(hwnd, WM_ACTIVATE, WA_ACTIVE, 0);
+    PostMessage(hwnd, WM_SETFOCUS, 0, 0);
 
     // Make lParam: (y << 16) | (x & 0xFFFF)
     final lParam = (y << 16) | (x & 0xFFFF);
@@ -135,6 +144,10 @@ class InputController {
       print('InputController: HWND not found for PID $pid');
       return;
     }
+
+    // Try to trick the window into thinking it's active
+    PostMessage(hwnd, WM_ACTIVATE, WA_ACTIVE, 0);
+    PostMessage(hwnd, WM_SETFOCUS, 0, 0);
 
     final msg = isDown ? WM_KEYDOWN : WM_KEYUP;
 
