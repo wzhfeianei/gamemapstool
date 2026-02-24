@@ -77,6 +77,7 @@ class _CapturePageState extends State<CapturePage> {
     }
     setState(() {
       _processLoading = true;
+      _loadingNotifier.value = true;
       _errorMessage = null;
     });
     try {
@@ -153,6 +154,7 @@ class _CapturePageState extends State<CapturePage> {
       if (mounted) {
         setState(() {
           _processLoading = false;
+          _loadingNotifier.value = false;
         });
       }
     }
@@ -422,6 +424,159 @@ class _CapturePageState extends State<CapturePage> {
     );
   }
 
+  void _showProcessSelectionDialog() {
+    _refreshProcessList();
+    showDialog(
+      context: context,
+      builder: (BuildContext context) {
+        return StatefulBuilder(
+          builder: (context, setState) {
+            // Use a timer or listener to update dialog when process list updates?
+            // Actually, since _processList is in the parent state and we are rebuilding via parent setState,
+            // we might need to listen to changes.
+            // But _refreshProcessList calls setState on the parent widget.
+            // Dialogs in Flutter are on a different route. Parent setState won't rebuild the dialog content
+            // unless we pass the data down or use a state management solution.
+            // Simple way: wrap the content in a widget that listens to the parent or re-fetch in dialog.
+            // For now, let's just rely on the fact that _processList is updated in the parent state.
+            // Wait, showDialog pushes a new route. The parent's build method is not called for the dialog content.
+            // We need to link the dialog state to the data.
+
+            return Dialog(
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(8),
+              ),
+              child: Container(
+                width: 600,
+                height: 400,
+                padding: const EdgeInsets.all(16),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    const Text(
+                      '选择捕获窗口',
+                      style: TextStyle(
+                        fontSize: 20,
+                        fontWeight: FontWeight.bold,
+                      ),
+                    ),
+                    const SizedBox(height: 4),
+                    const Text(
+                      '双击选中要捕获的窗口',
+                      style: TextStyle(color: Colors.grey),
+                    ),
+                    const SizedBox(height: 16),
+                    Expanded(
+                      // We need to access the parent's _processList and _processLoading status.
+                      // Since we are inside the parent class, we can access members.
+                      // But to trigger rebuilds of the dialog when they change, we need to be careful.
+                      // Let's use a ValueListenable or just pass a callback?
+                      // Actually, the simplest way for this specific case without major refactor:
+                      // Make the dialog content a StatefulWidget that handles its own refresh or listens to a stream.
+                      // BUT, _refreshProcessList is already implemented in parent.
+                      // Let's just assume the list is mostly ready or static for the moment,
+                      // OR (better) implement a simple polling in the dialog or use the parent's state properly.
+                      // Correct approach: The parent setState rebuilds the CapturePage, but NOT the Dialog.
+                      // We can pass the list to the dialog. But if the list updates (loading finishes), the dialog won't update.
+                      // So we should move the loading logic or use a StreamBuilder/ValueListenableBuilder.
+                      child: ValueListenableBuilder<bool>(
+                        valueListenable: _loadingNotifier,
+                        builder: (context, isLoading, child) {
+                          if (isLoading) {
+                            return const Center(
+                              child: CircularProgressIndicator(),
+                            );
+                          }
+                          return ListView.builder(
+                            itemCount: _processList.length,
+                            itemBuilder: (context, index) {
+                              final entry = _processList[index];
+                              final isSelected =
+                                  _selectedProcess?.pid == entry.pid;
+                              return InkWell(
+                                onTap: () {
+                                  // Optional: Single tap to highlight?
+                                },
+                                onDoubleTap: () {
+                                  // Update parent state
+                                  this.setState(() {
+                                    _selectedProcess = entry;
+                                  });
+                                  Navigator.of(context).pop();
+                                },
+                                child: Container(
+                                  padding: const EdgeInsets.all(8),
+                                  decoration: BoxDecoration(
+                                    color: isSelected
+                                        ? Theme.of(context).highlightColor
+                                        : null,
+                                    borderRadius: BorderRadius.circular(4),
+                                  ),
+                                  child: Row(
+                                    children: [
+                                      if (entry.iconBytes != null &&
+                                          entry.iconBytes!.isNotEmpty)
+                                        Image.memory(
+                                          entry.iconBytes!,
+                                          width: 32,
+                                          height: 32,
+                                        )
+                                      else
+                                        const Icon(Icons.apps, size: 32),
+                                      const SizedBox(width: 12),
+                                      Expanded(
+                                        child: Column(
+                                          crossAxisAlignment:
+                                              CrossAxisAlignment.start,
+                                          children: [
+                                            Text(
+                                              entry.windowTitle?.isNotEmpty ==
+                                                      true
+                                                  ? entry.windowTitle!
+                                                  : entry.name,
+                                              style: const TextStyle(
+                                                fontWeight: FontWeight.bold,
+                                              ),
+                                            ),
+                                            Text(
+                                              entry.name,
+                                              style: const TextStyle(
+                                                color: Colors.grey,
+                                                fontSize: 12,
+                                              ),
+                                            ),
+                                          ],
+                                        ),
+                                      ),
+                                    ],
+                                  ),
+                                ),
+                              );
+                            },
+                          );
+                        },
+                      ),
+                    ),
+                    const SizedBox(height: 16),
+                    Align(
+                      alignment: Alignment.centerRight,
+                      child: TextButton(
+                        onPressed: () => Navigator.of(context).pop(),
+                        child: const Text('取消'),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            );
+          },
+        );
+      },
+    );
+  }
+
+  final ValueNotifier<bool> _loadingNotifier = ValueNotifier(false);
+
   @override
   Widget build(BuildContext context) {
     String statusText = '尚未截图';
@@ -438,120 +593,104 @@ class _CapturePageState extends State<CapturePage> {
     }
 
     return Scaffold(
-      body: Padding(
-        padding: const EdgeInsets.all(16),
-        child: Column(
-          children: [
-            Row(
+      body: Column(
+        children: [
+          // Toolbar
+          Container(
+            height: 50,
+            padding: const EdgeInsets.symmetric(horizontal: 16),
+            decoration: BoxDecoration(
+              border: Border(bottom: BorderSide(color: Colors.grey.shade300)),
+            ),
+            child: Row(
               children: [
-                Expanded(
-                  child: SizedBox(
-                    height: 40,
-                    child: DropdownButtonFormField<ProcessEntry>(
-                      key: ValueKey<int>(_selectedProcess?.pid ?? 0),
-                      initialValue: _selectedProcess,
-                      isExpanded: true,
-                      isDense: true,
-                      decoration: InputDecoration(
-                        labelText: '进程',
-                        border: const OutlineInputBorder(),
-                        contentPadding: const EdgeInsets.symmetric(
-                          horizontal: 10,
-                          vertical: 8,
-                        ),
-                        suffixIcon: IconButton(
-                          icon: _processLoading
-                              ? const SizedBox(
-                                  width: 24,
-                                  height: 24,
-                                  child: CircularProgressIndicator(
-                                    strokeWidth: 2,
-                                  ),
-                                )
-                              : const Icon(Icons.refresh),
-                          onPressed: _processLoading
-                              ? null
-                              : _refreshProcessList,
-                          tooltip: '刷新进程列表',
-                        ),
-                      ),
-                      items: _processList
-                          .map(
-                            (ProcessEntry entry) =>
-                                DropdownMenuItem<ProcessEntry>(
-                                  value: entry,
-                                  child: _buildProcessItem(entry),
-                                ),
-                          )
-                          .toList(),
-                      onChanged: (ProcessEntry? value) {
-                        setState(() {
-                          _selectedProcess = value;
-                        });
-                      },
+                InkWell(
+                  onTap: () {
+                    _showProcessSelectionDialog();
+                  },
+                  borderRadius: BorderRadius.circular(4),
+                  child: Padding(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 8,
+                      vertical: 4,
                     ),
-                  ),
-                ),
-                const SizedBox(width: 12),
-                ElevatedButton(
-                  onPressed: _captureInProgress ? null : _captureOnce,
-                  child: Text(_captureInProgress ? '截图中...' : '手动截图'),
-                ),
-                const SizedBox(width: 12),
-                SizedBox(
-                  width: 140,
-                  height: 40,
-                  child: FilledButton(
-                    onPressed: _isBusy
-                        ? null
-                        : (_autoEnabled ? _stopAutoCapture : _startAutoCapture),
-                    child: Stack(
-                      alignment: Alignment.center,
+                    child: Row(
                       children: [
-                        Opacity(
-                          opacity: _isBusy ? 0 : 1,
-                          child: Text(_autoEnabled ? '停止实时捕获' : '开始实时捕获'),
-                        ),
-                        if (_isBusy)
-                          const SizedBox(
+                        if (_selectedProcess?.iconBytes != null)
+                          Image.memory(
+                            _selectedProcess!.iconBytes!,
                             width: 20,
                             height: 20,
-                            child: CircularProgressIndicator(
-                              strokeWidth: 2,
-                              color: Colors.white,
-                            ),
+                          )
+                        else
+                          const Icon(Icons.window, size: 20),
+                        const SizedBox(width: 8),
+                        ConstrainedBox(
+                          constraints: const BoxConstraints(maxWidth: 200),
+                          child: Text(
+                            _selectedProcess?.windowTitle ??
+                                _selectedProcess?.name ??
+                                '选择窗口',
+                            overflow: TextOverflow.ellipsis,
                           ),
+                        ),
+                        const Icon(Icons.arrow_drop_down),
                       ],
                     ),
                   ),
                 ),
+                const Spacer(),
+                IconButton(
+                  icon: const Icon(Icons.camera_alt),
+                  onPressed: _captureInProgress ? null : _captureOnce,
+                  tooltip: '手动截图',
+                ),
+                IconButton(
+                  icon: Icon(_autoEnabled ? Icons.stop_circle : Icons.videocam),
+                  color: _autoEnabled ? Colors.red : null,
+                  onPressed: _isBusy
+                      ? null
+                      : (_autoEnabled ? _stopAutoCapture : _startAutoCapture),
+                  tooltip: _autoEnabled ? '停止实时捕获' : '开始实时捕获',
+                ),
               ],
             ),
-            const SizedBox(height: 12),
-            Row(children: [Expanded(child: Text(statusText))]),
-            if (_errorMessage != null) ...[
-              const SizedBox(height: 8),
-              Align(
-                alignment: Alignment.centerLeft,
-                child: Text(
-                  _errorMessage!,
-                  style: TextStyle(color: Theme.of(context).colorScheme.error),
-                ),
-              ),
-            ],
-            const SizedBox(height: 12),
-            Expanded(
-              child: Container(
-                width: double.infinity,
-                decoration: BoxDecoration(
-                  border: Border.all(color: Colors.grey.shade300),
-                  borderRadius: BorderRadius.circular(8),
-                ),
-                child: _buildImagePreview(),
+          ),
+
+          Expanded(
+            child: Padding(
+              padding: const EdgeInsets.all(16),
+              child: Column(
+                children: [
+                  Row(children: [Expanded(child: Text(statusText))]),
+                  if (_errorMessage != null) ...[
+                    const SizedBox(height: 8),
+                    Align(
+                      alignment: Alignment.centerLeft,
+                      child: Text(
+                        _errorMessage!,
+                        style: TextStyle(
+                          color: Theme.of(context).colorScheme.error,
+                        ),
+                      ),
+                    ),
+                  ],
+                  const SizedBox(height: 12),
+                  Expanded(
+                    child: Container(
+                      width: double.infinity,
+                      decoration: BoxDecoration(
+                        border: Border.all(color: Colors.grey.shade300),
+                        borderRadius: BorderRadius.circular(8),
+                      ),
+                      child: _buildImagePreview(),
+                    ),
+                  ),
+                ],
               ),
             ),
-          ],
-        ),
+          ),
+        ],
       ),
     );
   }

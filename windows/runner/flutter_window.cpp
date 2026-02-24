@@ -191,9 +191,35 @@ struct ProcessRecord {
 struct ProcessEntry {
   DWORD pid;
   std::wstring name;
+  std::wstring window_title;
   double cpu;
   std::vector<uint8_t> icon_bytes;
 };
+
+std::unordered_map<DWORD, std::wstring> GetVisibleWindowPidsAndTitles() {
+    std::unordered_map<DWORD, std::wstring> pids;
+    EnumWindows([](HWND hwnd, LPARAM lparam) -> BOOL {
+        if (IsWindowVisible(hwnd)) {
+            int length = GetWindowTextLengthW(hwnd);
+            if (length > 0) {
+                std::wstring title(static_cast<size_t>(length), L'\0');
+                GetWindowTextW(hwnd, &title[0], length + 1);
+                
+                if (title == L"Program Manager") return TRUE;
+
+                DWORD pid;
+                GetWindowThreadProcessId(hwnd, &pid);
+                auto* pids_ptr = reinterpret_cast<std::unordered_map<DWORD, std::wstring>*>(lparam);
+                
+                if (pids_ptr->find(pid) == pids_ptr->end()) {
+                    (*pids_ptr)[pid] = title;
+                }
+            }
+        }
+        return TRUE;
+    }, reinterpret_cast<LPARAM>(&pids));
+    return pids;
+}
 
 std::vector<ProcessRecord> EnumerateProcesses() {
   std::vector<ProcessRecord> records;
@@ -481,12 +507,36 @@ std::vector<ProcessEntry> ListProcessesDetailed() {
   const DWORD processor_count = system_info.dwNumberOfProcessors;
 
   const std::vector<ProcessRecord> records = EnumerateProcesses();
+  const auto visible_windows = GetVisibleWindowPidsAndTitles();
+  
   std::vector<ProcessEntry> entries;
   entries.reserve(records.size());
   for (const auto& record : records) {
+    auto it_window = visible_windows.find(record.pid);
+    if (it_window == visible_windows.end()) {
+        continue;
+    }
+    
+    std::wstring name_lower = ToLower(record.name);
+    if (name_lower == L"svchost.exe" || 
+        name_lower == L"system" || 
+        name_lower == L"registry" || 
+        name_lower == L"smss.exe" || 
+        name_lower == L"csrss.exe" || 
+        name_lower == L"wininit.exe" || 
+        name_lower == L"services.exe" || 
+        name_lower == L"lsass.exe" ||
+        name_lower == L"winlogon.exe" ||
+        name_lower == L"fontdrvhost.exe" || 
+        name_lower == L"dwm.exe" ||
+        name_lower == L"applicationframehost.exe") {
+        continue;
+    }
+
     ProcessEntry entry;
     entry.pid = record.pid;
     entry.name = record.name;
+    entry.window_title = it_window->second;
     entry.cpu = 0.0;
     
     auto it_start = start_times.find(record.pid);
@@ -515,6 +565,12 @@ std::vector<ProcessEntry> ListProcessesDetailed() {
             [](const ProcessEntry& left, const ProcessEntry& right) {
               return left.cpu > right.cpu; // Sort by CPU usage descending
             });
+  
+  // Limit to top 20
+  if (entries.size() > 20) {
+      entries.resize(20);
+  }
+
   return entries;
 }
 
@@ -1013,15 +1069,17 @@ bool FlutterWindow::OnCreate() {
           list.reserve(processes.size());
           for (const auto& entry : processes) {
             flutter::EncodableMap item;
-            item[flutter::EncodableValue("pid")] =
-                flutter::EncodableValue(static_cast<int64_t>(entry.pid));
-            item[flutter::EncodableValue("name")] =
-                flutter::EncodableValue(WideToUtf8(entry.name));
-            item[flutter::EncodableValue("cpu")] =
-                flutter::EncodableValue(entry.cpu);
-            item[flutter::EncodableValue("icon")] =
-                flutter::EncodableValue(entry.icon_bytes);
-            list.emplace_back(item);
+          item[flutter::EncodableValue("pid")] =
+              flutter::EncodableValue(static_cast<int64_t>(entry.pid));
+          item[flutter::EncodableValue("name")] =
+              flutter::EncodableValue(WideToUtf8(entry.name));
+          item[flutter::EncodableValue("windowTitle")] =
+              flutter::EncodableValue(WideToUtf8(entry.window_title));
+          item[flutter::EncodableValue("cpu")] =
+              flutter::EncodableValue(entry.cpu);
+          item[flutter::EncodableValue("icon")] =
+              flutter::EncodableValue(entry.icon_bytes);
+          list.emplace_back(item);
           }
           result->Success(flutter::EncodableValue(list));
           return;
