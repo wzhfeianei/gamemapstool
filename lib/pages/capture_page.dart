@@ -82,7 +82,7 @@ class _CapturePageState extends State<CapturePage> {
   String? _lastInputStatus; // Store last input status for display
 
   // Search State
-  SearchResult? _lastSearchResult;
+  SearchResultStruct? _lastSearchResult;
   final TextEditingController _templatePathController = TextEditingController();
   // 用于显示 ROI 调试截图
   Uint8List? _debugRoiBytes;
@@ -578,57 +578,68 @@ class _CapturePageState extends State<CapturePage> {
                 final templateId = NativeImageSearch().loadTemplate(imagePath);
                 if (templateId <= 0) {
                   setState(() => _errorMessage = '加载模板失败 (ID: $templateId)');
-                  // 重新打开对话框显示结果
                   _showSearchDialog();
                   return;
                 }
 
-                // 获取窗口位置
-                final hwnd = _inputController.getHwndForPid(process.pid);
-                if (hwnd == 0) {
-                   setState(() => _errorMessage = '找不到窗口句柄');
+                // 2. 获取 WGC 截图 (关键修改：使用 Dart 层的 WGC，而不是 C++ GDI)
+                final stopwatchCapture = Stopwatch()..start();
+                final Uint8List? imageBytes = await _channel.invokeMethod<Uint8List>(
+                  'capture',
+                  <String, Object?>{'pid': process.pid, 'processName': process.name},
+                );
+                stopwatchCapture.stop();
+
+                if (imageBytes == null || imageBytes.isEmpty) {
+                   setState(() => _errorMessage = 'WGC 截图失败或返回为空');
                    NativeImageSearch().releaseTemplate(templateId);
                    _showSearchDialog();
                    return;
                 }
 
-                final rectPtr = calloc<win32.RECT>();
-                win32.GetWindowRect(hwnd, rectPtr);
-                final x = rectPtr.ref.left;
-                final y = rectPtr.ref.top;
-                final w = rectPtr.ref.right - rectPtr.ref.left;
-                final h = rectPtr.ref.bottom - rectPtr.ref.top;
-                calloc.free(rectPtr);
-
-                // 执行查找
-                final stopwatch = Stopwatch()..start();
-                final result = NativeImageSearch().findImage(
+                // 3. 执行查找 (使用 findImagesBatch)
+                final stopwatchSearch = Stopwatch()..start();
+                
+                // 构造请求：全图查找 (ROI = 0,0,-1,-1)
+                // 注意：这里是在 imageBytes (WGC 截图) 内部查找，坐标系是相对于截图左上角的
+                final request = SearchRequestStruct(
                   templateId, 
-                  x: x, y: y, w: w, h: h,
+                  roiX: 0, roiY: 0, roiW: -1, roiH: -1, 
                   threshold: 0.8
                 );
-                stopwatch.stop();
+                
+                final results = NativeImageSearch().findImagesBatch(
+                  imageBytes, 
+                  [request],
+                  width: 0, height: 0 // 0 表示自动识别 PNG/JPG
+                );
+                stopwatchSearch.stop();
                 
                 NativeImageSearch().releaseTemplate(templateId);
                 
                 // 读取调试截图
                 Uint8List? debugBytes;
-                final debugFile = File('debug_last_roi.png');
+                final debugFile = File('debug_last_batch_source.png');
                 if (debugFile.existsSync()) {
-                  // 添加时间戳防止缓存
-                  // 但 Image.memory 不需要，只要 bytes 变了就行
                   debugBytes = await debugFile.readAsBytes();
                 }
 
                 // 更新状态
                 setState(() {
                   _debugRoiBytes = debugBytes;
-                  if (result.score >= 0.8) {
-                    _lastSearchResult = result;
-                    _errorMessage = '✅ 找到目标! (${result.x}, ${result.y}) 置信度: ${result.score.toStringAsFixed(2)} 耗时: ${stopwatch.elapsedMilliseconds}ms';
+                  if (results.isNotEmpty && results[0].score >= 0.8) {
+                    final res = results[0];
+                    _lastSearchResult = SearchResultStruct(
+                        templateId: res.templateId, x: res.x, y: res.y, score: res.score); // 适配旧 UI 可能需要调整类型，这里先简单处理
+                    _errorMessage = '✅ 找到目标! (${res.x}, ${res.y}) 置信度: ${res.score.toStringAsFixed(2)}\n'
+                                    '截图耗时: ${stopwatchCapture.elapsedMilliseconds}ms\n'
+                                    '查找耗时: ${stopwatchSearch.elapsedMilliseconds}ms';
                   } else {
                     _lastSearchResult = null;
-                    _errorMessage = '❌ 未找到目标 (最高分: ${result.score.toStringAsFixed(2)}) 耗时: ${stopwatch.elapsedMilliseconds}ms';
+                    double maxScore = results.isNotEmpty ? results[0].score : 0.0;
+                    _errorMessage = '❌ 未找到目标 (最高分: ${maxScore.toStringAsFixed(2)})\n'
+                                    '截图耗时: ${stopwatchCapture.elapsedMilliseconds}ms\n'
+                                    '查找耗时: ${stopwatchSearch.elapsedMilliseconds}ms';
                   }
                 });
                 
