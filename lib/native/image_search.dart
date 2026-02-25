@@ -86,30 +86,41 @@ class NativeImageSearch {
     // 在 Release 模式下，DLL 与 exe 同级
     try {
       if (Platform.isWindows) {
-        // 尝试预加载 OpenCV DLL 以解决依赖问题
-        try {
-          // 尝试加载 Release 版
-          DynamicLibrary.open('opencv_world4120.dll');
-        } catch (_) {
+        final exePath = Platform.resolvedExecutable;
+        final dir = File(exePath).parent.path;
+        final opencvCandidates = <String>[
+          '$dir\\opencv_world4120.dll',
+          '$dir\\opencv_world4120d.dll',
+          'opencv_world4120.dll',
+          'opencv_world4120d.dll',
+        ];
+        bool opencvLoaded = false;
+        for (final candidate in opencvCandidates) {
+          if (opencvLoaded) break;
           try {
-            // 尝试加载 Debug 版
-            DynamicLibrary.open('opencv_world4120d.dll');
-          } catch (e) {
-            print('Warning: Failed to pre-load OpenCV DLL: $e');
-          }
+            DynamicLibrary.open(candidate);
+            opencvLoaded = true;
+          } catch (_) {}
+        }
+        if (!opencvLoaded) {
+          print('Warning: Failed to pre-load OpenCV DLL');
         }
 
-        try {
-          _lib = DynamicLibrary.open('native_image_search.dll');
-        } catch (e) {
-          print('Failed to load native_image_search.dll from default path: $e');
-          // 尝试使用绝对路径加载 (相对于可执行文件)
-          final exePath = Platform.resolvedExecutable;
-          final dir = File(exePath).parent.path;
-          final dllPath = '$dir\\native_image_search.dll';
-          print('Trying to load DLL from absolute path: $dllPath');
-          _lib = DynamicLibrary.open(dllPath);
+        final nativeCandidates = <String>[
+          '$dir\\native_image_search.dll',
+          'native_image_search.dll',
+        ];
+        DynamicLibrary? loaded;
+        for (final candidate in nativeCandidates) {
+          if (loaded != null) break;
+          try {
+            loaded = DynamicLibrary.open(candidate);
+          } catch (_) {}
         }
+        if (loaded == null) {
+          throw Exception('Failed to load native_image_search.dll');
+        }
+        _lib = loaded;
       } else {
         throw UnsupportedError('This plugin only supports Windows');
       }
