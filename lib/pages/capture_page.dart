@@ -86,7 +86,7 @@ class _CapturePageState extends State<CapturePage> {
   final TextEditingController _templatePathController = TextEditingController();
   // 用于显示 ROI 调试截图
   Uint8List? _debugRoiBytes;
-  
+
   @override
   void initState() {
     super.initState();
@@ -440,7 +440,16 @@ class _CapturePageState extends State<CapturePage> {
 
   Future<void> _captureLoop() async {
     if (!_autoEnabled) return;
-    if (_textureId != null) return;
+
+    // 如果已经获取到纹理且尺寸有效，就不需要继续轮询了
+    // 除非我们想要监控尺寸变化（比如窗口缩放），这里假设只需要获取一次有效尺寸即可
+    if (_textureId != null &&
+        _textureWidth != null &&
+        _textureWidth! > 0 &&
+        _textureHeight != null &&
+        _textureHeight! > 0) {
+      return;
+    }
 
     // Retry getting texture ID instead of falling back to slow PNG capture
     try {
@@ -457,8 +466,12 @@ class _CapturePageState extends State<CapturePage> {
               _textureWidth = w?.toDouble();
               _textureHeight = h?.toDouble();
             });
+
+            // 如果获取到的尺寸有效，就停止轮询
+            if (w != null && w > 0 && h != null && h > 0) {
+              return;
+            }
           }
-          return; // Exit loop, texture is ready
         }
       }
     } catch (e) {
@@ -467,8 +480,8 @@ class _CapturePageState extends State<CapturePage> {
 
     if (!mounted || !_autoEnabled) return;
 
-    // Wait before retrying
-    Future<void>.delayed(const Duration(milliseconds: 500), _captureLoop);
+    // Wait before retrying (short interval for smoother startup)
+    Future<void>.delayed(const Duration(milliseconds: 100), _captureLoop);
   }
 
   Future<void> _stopAutoCapture() async {
@@ -518,20 +531,20 @@ class _CapturePageState extends State<CapturePage> {
     }
 
     // 自动定位资源图片: yuanshen/juqing.png
-    // 优先级: 
+    // 优先级:
     // 1. 相对于 exe 的路径 (发布模式)
     // 2. 项目根目录 (调试模式)
     // 3. 绝对路径 (Fallback)
-    
+
     final exeDir = File(Platform.resolvedExecutable).parent.path;
     String imagePath = '$exeDir\\yuanshen\\juqing.png';
-    
+
     if (!File(imagePath).existsSync()) {
       // 调试模式下，exe 在 build/windows/runner/Debug，资源在项目根目录
       // 尝试回退几层目录找 (简单起见，假设当前工作目录就是项目根目录)
       imagePath = 'yuanshen/juqing.png';
     }
-    
+
     // 如果还找不到，提示用户
     final bool fileExists = File(imagePath).existsSync();
 
@@ -543,24 +556,37 @@ class _CapturePageState extends State<CapturePage> {
           mainAxisSize: MainAxisSize.min,
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            Text('目标资源: yuanshen/juqing.png', style: const TextStyle(fontWeight: FontWeight.bold)),
+            Text(
+              '目标资源: yuanshen/juqing.png',
+              style: const TextStyle(fontWeight: FontWeight.bold),
+            ),
             const SizedBox(height: 4),
-            Text('实际路径: $imagePath', style: TextStyle(fontSize: 10, color: Colors.grey)),
-            Text('状态: ${fileExists ? "✅ 文件存在" : "❌ 文件不存在"}', 
-              style: TextStyle(color: fileExists ? Colors.green : Colors.red)),
+            Text(
+              '实际路径: $imagePath',
+              style: TextStyle(fontSize: 10, color: Colors.grey),
+            ),
+            Text(
+              '状态: ${fileExists ? "✅ 文件存在" : "❌ 文件不存在"}',
+              style: TextStyle(color: fileExists ? Colors.green : Colors.red),
+            ),
             const SizedBox(height: 12),
-            
+
             if (_debugRoiBytes != null) ...[
-               const Text('上次查找的 ROI 区域截图:', style: TextStyle(fontWeight: FontWeight.bold)),
-               const SizedBox(height: 4),
-               Container(
-                 height: 150,
-                 width: double.infinity,
-                 decoration: BoxDecoration(border: Border.all(color: Colors.grey)),
-                 child: Image.memory(_debugRoiBytes!, fit: BoxFit.contain),
-               ),
+              const Text(
+                '上次查找的 ROI 区域截图:',
+                style: TextStyle(fontWeight: FontWeight.bold),
+              ),
+              const SizedBox(height: 4),
+              Container(
+                height: 150,
+                width: double.infinity,
+                decoration: BoxDecoration(
+                  border: Border.all(color: Colors.grey),
+                ),
+                child: Image.memory(_debugRoiBytes!, fit: BoxFit.contain),
+              ),
             ] else
-               const Text('暂无调试截图'),
+              const Text('暂无调试截图'),
           ],
         ),
         actions: [
@@ -569,88 +595,106 @@ class _CapturePageState extends State<CapturePage> {
             child: const Text('关闭'),
           ),
           ElevatedButton(
-            onPressed: !fileExists ? null : () async {
-              // 1. 关闭当前对话框
-              Navigator.pop(context);
-              
-              try {
-                // 加载模板
-                final templateId = NativeImageSearch().loadTemplate(imagePath);
-                if (templateId <= 0) {
-                  setState(() => _errorMessage = '加载模板失败 (ID: $templateId)');
-                  _showSearchDialog();
-                  return;
-                }
+            onPressed: !fileExists
+                ? null
+                : () async {
+                    // 1. 关闭当前对话框
+                    Navigator.pop(context);
 
-                // 2. 获取 WGC 截图 (关键修改：使用 Dart 层的 WGC，而不是 C++ GDI)
-                final stopwatchCapture = Stopwatch()..start();
-                final Uint8List? imageBytes = await _channel.invokeMethod<Uint8List>(
-                  'capture',
-                  <String, Object?>{'pid': process.pid, 'processName': process.name},
-                );
-                stopwatchCapture.stop();
+                    try {
+                      // 加载模板
+                      final templateId = NativeImageSearch().loadTemplate(
+                        imagePath,
+                      );
+                      if (templateId <= 0) {
+                        setState(
+                          () => _errorMessage = '加载模板失败 (ID: $templateId)',
+                        );
+                        _showSearchDialog();
+                        return;
+                      }
 
-                if (imageBytes == null || imageBytes.isEmpty) {
-                   setState(() => _errorMessage = 'WGC 截图失败或返回为空');
-                   NativeImageSearch().releaseTemplate(templateId);
-                   _showSearchDialog();
-                   return;
-                }
+                      // 2. 获取 WGC 截图 (关键修改：使用 Dart 层的 WGC，而不是 C++ GDI)
+                      final stopwatchCapture = Stopwatch()..start();
+                      final Uint8List? imageBytes = await _channel
+                          .invokeMethod<Uint8List>('capture', <String, Object?>{
+                            'pid': process.pid,
+                            'processName': process.name,
+                          });
+                      stopwatchCapture.stop();
 
-                // 3. 执行查找 (使用 findImagesBatch)
-                final stopwatchSearch = Stopwatch()..start();
-                
-                // 构造请求：全图查找 (ROI = 0,0,-1,-1)
-                // 注意：这里是在 imageBytes (WGC 截图) 内部查找，坐标系是相对于截图左上角的
-                final request = SearchRequestStruct(
-                  templateId, 
-                  roiX: 0, roiY: 0, roiW: -1, roiH: -1, 
-                  threshold: 0.8
-                );
-                
-                final results = NativeImageSearch().findImagesBatch(
-                  imageBytes, 
-                  [request],
-                  width: 0, height: 0 // 0 表示自动识别 PNG/JPG
-                );
-                stopwatchSearch.stop();
-                
-                NativeImageSearch().releaseTemplate(templateId);
-                
-                // 读取调试截图
-                Uint8List? debugBytes;
-                final debugFile = File('debug_last_batch_source.png');
-                if (debugFile.existsSync()) {
-                  debugBytes = await debugFile.readAsBytes();
-                }
+                      if (imageBytes == null || imageBytes.isEmpty) {
+                        setState(() => _errorMessage = 'WGC 截图失败或返回为空');
+                        NativeImageSearch().releaseTemplate(templateId);
+                        _showSearchDialog();
+                        return;
+                      }
 
-                // 更新状态
-                setState(() {
-                  _debugRoiBytes = debugBytes;
-                  if (results.isNotEmpty && results[0].score >= 0.8) {
-                    final res = results[0];
-                    _lastSearchResult = SearchResultStruct(
-                        templateId: res.templateId, x: res.x, y: res.y, score: res.score); // 适配旧 UI 可能需要调整类型，这里先简单处理
-                    _errorMessage = '✅ 找到目标! (${res.x}, ${res.y}) 置信度: ${res.score.toStringAsFixed(2)}\n'
-                                    '截图耗时: ${stopwatchCapture.elapsedMilliseconds}ms\n'
-                                    '查找耗时: ${stopwatchSearch.elapsedMilliseconds}ms';
-                  } else {
-                    _lastSearchResult = null;
-                    double maxScore = results.isNotEmpty ? results[0].score : 0.0;
-                    _errorMessage = '❌ 未找到目标 (最高分: ${maxScore.toStringAsFixed(2)})\n'
-                                    '截图耗时: ${stopwatchCapture.elapsedMilliseconds}ms\n'
-                                    '查找耗时: ${stopwatchSearch.elapsedMilliseconds}ms';
-                  }
-                });
-                
-                // 重新打开对话框，刷新显示
-                if (mounted) _showSearchDialog();
+                      // 3. 执行查找 (使用 findImagesBatch)
+                      final stopwatchSearch = Stopwatch()..start();
 
-              } catch (e) {
-                setState(() => _errorMessage = '搜索异常: $e');
-                if (mounted) _showSearchDialog();
-              }
-            },
+                      // 构造请求：全图查找 (ROI = 0,0,-1,-1)
+                      // 注意：这里是在 imageBytes (WGC 截图) 内部查找，坐标系是相对于截图左上角的
+                      final request = SearchRequestStruct(
+                        templateId,
+                        roiX: 0,
+                        roiY: 0,
+                        roiW: -1,
+                        roiH: -1,
+                        threshold: 0.8,
+                      );
+
+                      final results = NativeImageSearch().findImagesBatch(
+                        imageBytes,
+                        [request],
+                        width: 0,
+                        height: 0, // 0 表示自动识别 PNG/JPG
+                      );
+                      stopwatchSearch.stop();
+
+                      NativeImageSearch().releaseTemplate(templateId);
+
+                      // 读取调试截图
+                      Uint8List? debugBytes;
+                      final debugFile = File('debug_last_batch_source.png');
+                      if (debugFile.existsSync()) {
+                        debugBytes = await debugFile.readAsBytes();
+                      }
+
+                      // 更新状态
+                      setState(() {
+                        _debugRoiBytes = debugBytes;
+                        if (results.isNotEmpty && results[0].score >= 0.8) {
+                          final res = results[0];
+                          _lastSearchResult = SearchResultStruct(
+                            templateId: res.templateId,
+                            x: res.x,
+                            y: res.y,
+                            score: res.score,
+                          ); // 适配旧 UI 可能需要调整类型，这里先简单处理
+                          _errorMessage =
+                              '✅ 找到目标! (${res.x}, ${res.y}) 置信度: ${res.score.toStringAsFixed(2)}\n'
+                              '截图耗时: ${stopwatchCapture.elapsedMilliseconds}ms\n'
+                              '查找耗时: ${stopwatchSearch.elapsedMilliseconds}ms';
+                        } else {
+                          _lastSearchResult = null;
+                          double maxScore = results.isNotEmpty
+                              ? results[0].score
+                              : 0.0;
+                          _errorMessage =
+                              '❌ 未找到目标 (最高分: ${maxScore.toStringAsFixed(2)})\n'
+                              '截图耗时: ${stopwatchCapture.elapsedMilliseconds}ms\n'
+                              '查找耗时: ${stopwatchSearch.elapsedMilliseconds}ms';
+                        }
+                      });
+
+                      // 重新打开对话框，刷新显示
+                      if (mounted) _showSearchDialog();
+                    } catch (e) {
+                      setState(() => _errorMessage = '搜索异常: $e');
+                      if (mounted) _showSearchDialog();
+                    }
+                  },
             child: const Text('查找'),
           ),
         ],
@@ -660,18 +704,31 @@ class _CapturePageState extends State<CapturePage> {
 
   Widget _buildImagePreview() {
     Widget content;
-    if (_textureId != null) {
-      Widget image = Texture(textureId: _textureId!);
-      if (_textureWidth != null &&
-          _textureHeight != null &&
-          _textureHeight! > 0) {
-        image = SizedBox(
-          width: _textureWidth,
-          height: _textureHeight,
-          child: image,
-        );
-      }
-      content = image;
+    // 严格检查纹理尺寸，防止传递 0 或 null 导致 TransformLayer 错误
+    if (_textureId != null &&
+        _textureWidth != null &&
+        _textureWidth! > 0 &&
+        _textureHeight != null &&
+        _textureHeight! > 0) {
+      content = SizedBox(
+        width: _textureWidth,
+        height: _textureHeight,
+        child: Texture(textureId: _textureId!),
+      );
+    } else if (_textureId != null) {
+      // 有纹理 ID 但没有尺寸，说明正在初始化或等待第一帧
+      return Container(
+        alignment: Alignment.center,
+        color: Colors.black12,
+        child: const Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            CircularProgressIndicator(),
+            SizedBox(height: 8),
+            Text('正在初始化画面...'),
+          ],
+        ),
+      );
     } else if (_imageBytes == null || _imageBytes!.isEmpty) {
       return Container(
         alignment: Alignment.center,
