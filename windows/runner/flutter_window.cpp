@@ -1065,6 +1065,15 @@ bool FlutterWindow::OnCreate() {
           GetLastFrame(std::move(result));
           return;
         }
+        if (call.method_name() == "updateOverlay") {
+          UpdateOverlay(call, std::move(result));
+          return;
+        }
+        if (call.method_name() == "closeOverlay") {
+          CloseOverlay();
+          result->Success();
+          return;
+        }
         if (call.method_name() == "listProcesses") {
           const std::vector<ProcessEntry> processes = ListProcessesDetailed();
           flutter::EncodableList list;
@@ -1478,53 +1487,47 @@ void FlutterWindow::GetTextureId(std::unique_ptr<flutter::MethodResult<flutter::
 }
 
 void FlutterWindow::GetLastFrame(std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> result) {
-  if (!capture_texture_) {
-    result->Error("NO_TEXTURE", "Capture texture not initialized");
-    return;
-  }
+    std::vector<uint8_t> bmp_data;
+    {
+        std::lock_guard<std::mutex> lock(frame_mutex_);
+        if (!is_capturing_ || last_frame_data_.empty()) {
+            result->Error("NO_FRAME", "No frame captured yet");
+            return;
+        }
+        
+        int width = last_frame_width_;
+        int height = last_frame_height_;
+        size_t imageSize = last_frame_data_.size();
+        
+        bmp_data.resize(sizeof(BITMAPFILEHEADER) + sizeof(BITMAPINFOHEADER) + imageSize);
+        uint8_t* dst_buffer = bmp_data.data();
 
-  std::vector<uint8_t> buffer;
-  size_t width, height;
-  if (!capture_texture_->GetContent(&buffer, &width, &height)) {
-    result->Error("NO_CONTENT", "No content in texture");
-    return;
-  }
+        BITMAPFILEHEADER* bmfh = (BITMAPFILEHEADER*)dst_buffer;
+        BITMAPINFOHEADER* bmih = (BITMAPINFOHEADER*)(dst_buffer + sizeof(BITMAPFILEHEADER));
 
-  HRESULT com_init = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+        bmfh->bfType = 0x4D42; // "BM"
+        bmfh->bfSize = static_cast<DWORD>(bmp_data.size());
+        bmfh->bfReserved1 = 0;
+        bmfh->bfReserved2 = 0;
+        bmfh->bfOffBits = sizeof(BITMAPFILEHEADER) + sizeof(BITMAPINFOHEADER);
 
-  ComPtr<IWICImagingFactory> factory;
-  HRESULT hr = CoCreateInstance(CLSID_WICImagingFactory, nullptr,
-                        CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&factory));
-  if (FAILED(hr)) {
-     if (SUCCEEDED(com_init)) CoUninitialize();
-     result->Error("WIC_ERROR", "Failed to create WIC factory");
-     return;
-  }
-
-  ComPtr<IWICBitmap> wic_bitmap;
-  hr = factory->CreateBitmapFromMemory(
-      static_cast<UINT>(width), static_cast<UINT>(height),
-      GUID_WICPixelFormat32bppRGBA,
-      static_cast<UINT>(width * 4),
-      static_cast<UINT>(buffer.size()),
-      buffer.data(),
-      &wic_bitmap);
-
-  if (FAILED(hr)) {
-     if (SUCCEEDED(com_init)) CoUninitialize();
-     result->Error("WIC_ERROR", "Failed to create bitmap from memory");
-     return;
-  }
-
-  std::vector<uint8_t> output;
-  std::wstring error;
-  if (EncodeWicBitmapToPng(factory.Get(), wic_bitmap.Get(), &output, &error)) {
-      result->Success(flutter::EncodableValue(output));
-  } else {
-      result->Error("ENCODE_ERROR", Utf8FromUtf16(error.c_str()));
-  }
-
-  if (SUCCEEDED(com_init)) CoUninitialize();
+        bmih->biSize = sizeof(BITMAPINFOHEADER);
+        bmih->biWidth = width;
+        bmih->biHeight = -height; // Top-down
+        bmih->biPlanes = 1;
+        bmih->biBitCount = 32;
+        bmih->biCompression = BI_RGB;
+        bmih->biSizeImage = static_cast<DWORD>(imageSize);
+        bmih->biXPelsPerMeter = 0;
+        bmih->biYPelsPerMeter = 0;
+        bmih->biClrUsed = 0;
+        bmih->biClrImportant = 0;
+        
+        uint8_t* pixels = dst_buffer + bmfh->bfOffBits;
+        memcpy(pixels, last_frame_data_.data(), imageSize);
+    }
+    
+    result->Success(flutter::EncodableValue(bmp_data));
 }
 
 void FlutterWindow::OnFrameArrived(
@@ -1634,9 +1637,106 @@ void FlutterWindow::OnFrameArrived(
             capture_texture_->UpdateFrame((uint8_t*)mapped.pData, client_width, client_height, mapped.RowPitch);
         }
         
+        // Cache for GetLastFrame
+        {
+            std::lock_guard<std::mutex> cache_lock(frame_mutex_);
+            if (is_capturing_) {
+                UINT stride = client_width * 4;
+                size_t size = stride * client_height;
+                if (last_frame_data_.size() != size) {
+                    last_frame_data_.resize(size);
+                }
+                
+                last_frame_width_ = client_width;
+                last_frame_height_ = client_height;
+                last_frame_stride_ = stride;
+
+                uint8_t* dst = last_frame_data_.data();
+                const uint8_t* src = (const uint8_t*)mapped.pData;
+                
+                if (mapped.RowPitch == stride) {
+                    memcpy(dst, src, size);
+                } else {
+                    for (UINT y = 0; y < client_height; ++y) {
+                        memcpy(dst + y * stride, src + y * mapped.RowPitch, stride);
+                    }
+                }
+            }
+        }
+        
         local_context->Unmap(local_staging.Get(), 0);
     } catch (...) {
         // Catch all exceptions to prevent crash from winrt or other issues
         // OutputDebugStringA("Exception in OnFrameArrived\n");
+    }
+}
+
+void FlutterWindow::UpdateOverlay(const flutter::MethodCall<flutter::EncodableValue>& call,
+                                  std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> result) {
+    if (!current_capture_hwnd_ || !IsWindow(current_capture_hwnd_)) {
+        result->Error("NO_WINDOW", "No target window to overlay");
+        return;
+    }
+
+    const auto* args = std::get_if<flutter::EncodableMap>(call.arguments());
+    if (!args) {
+        result->Error("INVALID_ARGS", "Arguments must be a map");
+        return;
+    }
+
+    auto rects_it = args->find(flutter::EncodableValue("rects"));
+    if (rects_it == args->end() || !std::holds_alternative<flutter::EncodableList>(rects_it->second)) {
+        result->Error("INVALID_ARGS", "Missing rects list");
+        return;
+    }
+
+    const auto& rects_list = std::get<flutter::EncodableList>(rects_it->second);
+    std::vector<OverlayRect> overlay_rects;
+    overlay_rects.reserve(rects_list.size());
+
+    for (const auto& item : rects_list) {
+        if (std::holds_alternative<flutter::EncodableMap>(item)) {
+            const auto& map = std::get<flutter::EncodableMap>(item);
+            
+            auto get_int = [&](const std::string& key) -> int {
+                auto it = map.find(flutter::EncodableValue(key));
+                if (it != map.end()) {
+                    if (std::holds_alternative<int32_t>(it->second)) return std::get<int32_t>(it->second);
+                    if (std::holds_alternative<int64_t>(it->second)) return static_cast<int>(std::get<int64_t>(it->second));
+                    if (std::holds_alternative<double>(it->second)) return static_cast<int>(std::get<double>(it->second));
+                }
+                return 0;
+            };
+
+            int x = get_int("x");
+            int y = get_int("y");
+            int w = get_int("width");
+            int h = get_int("height");
+            
+            overlay_rects.push_back({x, y, w, h});
+        }
+    }
+
+    if (!overlay_window_) {
+        overlay_window_ = std::make_unique<OverlayWindow>();
+        if (!overlay_window_->Create()) {
+            result->Error("CREATE_FAILED", "Failed to create overlay window");
+            return;
+        }
+    }
+
+    overlay_window_->UpdatePosition(current_capture_hwnd_);
+    overlay_window_->SetRects(overlay_rects);
+    if (!overlay_window_->IsVisible()) {
+        overlay_window_->Show();
+    }
+
+    result->Success();
+}
+
+void FlutterWindow::CloseOverlay() {
+    if (overlay_window_) {
+        overlay_window_->Destroy();
+        overlay_window_.reset();
     }
 }

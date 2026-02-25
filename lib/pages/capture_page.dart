@@ -558,6 +558,12 @@ class _CapturePageState extends State<CapturePage> {
     _autoTaskTimer?.cancel();
     _autoTaskTimer = null;
 
+    try {
+      await _channel.invokeMethod('closeOverlay');
+    } catch (e) {
+      debugPrint('Close overlay error: $e');
+    }
+
     for (final id in _taskTemplateIds.values) {
       NativeImageSearch().releaseTemplate(id);
     }
@@ -575,11 +581,7 @@ class _CapturePageState extends State<CapturePage> {
 
     try {
       final Uint8List? imageBytes = await _channel.invokeMethod<Uint8List>(
-        'capture',
-        <String, Object?>{
-          'pid': _selectedProcess!.pid,
-          'processName': _selectedProcess!.name,
-        },
+        'getLastFrame',
       );
 
       if (imageBytes == null || imageBytes.isEmpty) return;
@@ -621,7 +623,7 @@ class _CapturePageState extends State<CapturePage> {
             imageBytes,
             subRequests,
           );
-          
+
           bool foundSub = false;
           for (final res in subResults) {
             if (res.score >= 0.8) {
@@ -636,6 +638,26 @@ class _CapturePageState extends State<CapturePage> {
             _inputController.sendKeyEvent(_selectedProcess!.pid, 0x46, false);
           }
         }
+      }
+
+      // Update Overlay
+      List<Map<String, dynamic>> overlayRects = [];
+      for (final res in currentResults) {
+        final size = _taskTemplateSizes[res.templateId];
+        if (size != null) {
+          overlayRects.add({
+            'x': res.x,
+            'y': res.y,
+            'width': size.width.toInt(),
+            'height': size.height.toInt(),
+          });
+        }
+      }
+
+      try {
+        await _channel.invokeMethod('updateOverlay', {'rects': overlayRects});
+      } catch (e) {
+        debugPrint('Update overlay error: $e');
       }
 
       if (mounted) {

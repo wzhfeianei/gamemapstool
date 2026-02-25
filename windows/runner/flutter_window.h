@@ -16,6 +16,7 @@
 #include <variant>
 
 #include "win32_window.h"
+#include "overlay_window.h"
 
 #include <winrt/Windows.Graphics.Capture.h>
 #include <winrt/Windows.Graphics.DirectX.Direct3D11.h>
@@ -96,6 +97,9 @@ class FlutterWindow : public Win32Window {
   D3D11_TEXTURE2D_DESC staging_desc_ = {};
 
   std::vector<uint8_t> last_frame_data_;
+  UINT last_frame_width_ = 0;
+  UINT last_frame_height_ = 0;
+  UINT last_frame_stride_ = 0;
   std::mutex frame_mutex_;
   bool is_capturing_ = false;
   winrt::event_token frame_arrived_token_;
@@ -106,6 +110,12 @@ class FlutterWindow : public Win32Window {
   void GetCaptureFrame(const flutter::MethodCall<flutter::EncodableValue>& call, std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> result);
   void GetLastFrame(std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> result);
   void GetTextureId(std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> result);
+
+  // Overlay
+  void UpdateOverlay(const flutter::MethodCall<flutter::EncodableValue>& call,
+                     std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> result);
+  void CloseOverlay();
+
   void OnFrameArrived(winrt::Windows::Graphics::Capture::Direct3D11CaptureFramePool const& sender,
                       winrt::Windows::Foundation::IInspectable const& args);
 
@@ -120,6 +130,9 @@ class FlutterWindow : public Win32Window {
   UINT cached_client_height_ = 0;
   UINT cached_offset_x_ = 0;
   UINT cached_offset_y_ = 0;
+
+  // Overlay Window
+  std::unique_ptr<OverlayWindow> overlay_window_;
 };
 
 #endif  // RUNNER_FLUTTER_WINDOW_H_
