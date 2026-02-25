@@ -53,6 +53,8 @@ class ProcessEntry {
 
 class _CapturePageState extends State<CapturePage> {
   static const MethodChannel _channel = MethodChannel('gamemapstool/capture');
+  static const double _defaultTextureWidth = 1920;
+  static const double _defaultTextureHeight = 1080;
 
   List<ProcessEntry> _processList = [];
   ProcessEntry? _selectedProcess;
@@ -72,6 +74,8 @@ class _CapturePageState extends State<CapturePage> {
   double? _textureHeight;
   int? _imageWidth;
   int? _imageHeight;
+  int? _lastResizeWidth;
+  int? _lastResizeHeight;
 
   Timer? _checkAliveTimer;
 
@@ -372,6 +376,29 @@ class _CapturePageState extends State<CapturePage> {
     }
   }
 
+  Future<void> _resizePreviewWindow() async {
+    if (!_autoEnabled) return;
+    final double? width = _textureWidth;
+    final double? height = _textureHeight;
+    if (width == null || height == null || width <= 0 || height <= 0) {
+      return;
+    }
+    final double devicePixelRatio = MediaQuery.of(context).devicePixelRatio;
+    final int targetWidth = (width / devicePixelRatio).round();
+    final int targetHeight = (height / devicePixelRatio).round();
+    if (_lastResizeWidth == targetWidth && _lastResizeHeight == targetHeight) {
+      return;
+    }
+    _lastResizeWidth = targetWidth;
+    _lastResizeHeight = targetHeight;
+    try {
+      await _channel.invokeMethod('resizePreviewWindow', <String, Object?>{
+        'width': targetWidth,
+        'height': targetHeight,
+      });
+    } catch (e) {}
+  }
+
   Future<void> _startAutoCapture() async {
     if (_autoEnabled || _isBusy) {
       return;
@@ -413,6 +440,7 @@ class _CapturePageState extends State<CapturePage> {
               _textureWidth = w?.toDouble();
               _textureHeight = h?.toDouble();
             });
+            await _resizePreviewWindow();
           }
         }
       } catch (e) {
@@ -462,6 +490,7 @@ class _CapturePageState extends State<CapturePage> {
             });
 
             if (w != null && w > 0 && h != null && h > 0) {
+              await _resizePreviewWindow();
               return;
             }
           }
@@ -502,6 +531,8 @@ class _CapturePageState extends State<CapturePage> {
         setState(() {
           _autoEnabled = false;
           _textureId = null;
+          _lastResizeWidth = null;
+          _lastResizeHeight = null;
           _isBusy = false;
         });
       }
@@ -870,15 +901,38 @@ class _CapturePageState extends State<CapturePage> {
   }
 
   Widget _buildImagePreview() {
+    final double devicePixelRatio = MediaQuery.of(context).devicePixelRatio;
+    const Widget loadingOverlay = ColoredBox(
+      color: Colors.black12,
+      child: Center(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            CircularProgressIndicator(),
+            SizedBox(height: 8),
+            Text('正在初始化画面...'),
+          ],
+        ),
+      ),
+    );
     Widget content;
-    if (_textureId != null &&
-        _textureWidth != null &&
-        _textureWidth! > 0 &&
-        _textureHeight != null &&
-        _textureHeight! > 0) {
+    if (_textureId != null) {
+      final bool hasTextureSize =
+          _textureWidth != null &&
+          _textureWidth! > 0 &&
+          _textureHeight != null &&
+          _textureHeight! > 0;
+      final double rawWidth = hasTextureSize
+          ? _textureWidth!
+          : _defaultTextureWidth;
+      final double rawHeight = hasTextureSize
+          ? _textureHeight!
+          : _defaultTextureHeight;
+      final double renderWidth = rawWidth / devicePixelRatio;
+      final double renderHeight = rawHeight / devicePixelRatio;
       content = SizedBox(
-        width: _textureWidth,
-        height: _textureHeight,
+        width: renderWidth,
+        height: renderHeight,
         child: Stack(
           fit: StackFit.expand,
           children: [
@@ -891,21 +945,17 @@ class _CapturePageState extends State<CapturePage> {
                   _taskTemplateIds,
                 ),
               ),
+            if (!hasTextureSize) loadingOverlay,
           ],
         ),
       );
-    } else if (_textureId != null) {
-      return Container(
-        alignment: Alignment.center,
-        color: Colors.black12,
-        child: const Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            CircularProgressIndicator(),
-            SizedBox(height: 8),
-            Text('正在初始化画面...'),
-          ],
-        ),
+    } else if (_autoEnabled) {
+      final double renderWidth = _defaultTextureWidth / devicePixelRatio;
+      final double renderHeight = _defaultTextureHeight / devicePixelRatio;
+      content = SizedBox(
+        width: renderWidth,
+        height: renderHeight,
+        child: loadingOverlay,
       );
     } else if (_imageBytes == null || _imageBytes!.isEmpty) {
       return Container(
@@ -944,16 +994,17 @@ class _CapturePageState extends State<CapturePage> {
       child: content,
     );
 
+    final bool enableTransform = !_controlEnabled && !_autoEnabled;
     return RawKeyboardListener(
       focusNode: _inputFocusNode,
       onKey: _handleKey,
       autofocus: _controlEnabled,
       child: InteractiveViewer(
         constrained: false,
-        minScale: 0.2,
-        maxScale: 5,
-        panEnabled: !_controlEnabled,
-        scaleEnabled: !_controlEnabled,
+        minScale: 1,
+        maxScale: 1,
+        panEnabled: enableTransform,
+        scaleEnabled: enableTransform,
         child: Center(child: content),
       ),
     );

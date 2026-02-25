@@ -210,8 +210,8 @@ extern "C" {
             return; // 图片无效
         }
         
-        // 保存调试图
-        cv::imwrite("debug_last_batch_source.png", sourceImage);
+        // 不要保存调试图,性能影响较大
+        //cv::imwrite("debug_last_batch_source.png", sourceImage);
 
         // 2. 批量处理任务
         for (int i = 0; i < count; i++) {

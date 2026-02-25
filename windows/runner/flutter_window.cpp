@@ -1057,6 +1057,10 @@ bool FlutterWindow::OnCreate() {
           GetTextureId(std::move(result));
           return;
         }
+        if (call.method_name() == "resizePreviewWindow") {
+          ResizePreviewWindow(call, std::move(result));
+          return;
+        }
         if (call.method_name() == "getCaptureFrame") {
           GetCaptureFrame(call, std::move(result));
           return;
@@ -1484,6 +1488,64 @@ void FlutterWindow::GetTextureId(std::unique_ptr<flutter::MethodResult<flutter::
   } else {
     result->Error("NO_TEXTURE", "Capture texture not initialized");
   }
+}
+
+void FlutterWindow::ResizePreviewWindow(const flutter::MethodCall<flutter::EncodableValue>& call,
+                                        std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> result) {
+  const auto* args = std::get_if<flutter::EncodableMap>(call.arguments());
+  if (!args) {
+    result->Error("bad-args", "Missing arguments");
+    return;
+  }
+
+  int width = 0;
+  int height = 0;
+  auto width_it = args->find(flutter::EncodableValue("width"));
+  auto height_it = args->find(flutter::EncodableValue("height"));
+  if (width_it != args->end()) {
+    if (std::holds_alternative<int32_t>(width_it->second)) {
+      width = std::get<int32_t>(width_it->second);
+    } else if (std::holds_alternative<int64_t>(width_it->second)) {
+      width = static_cast<int>(std::get<int64_t>(width_it->second));
+    }
+  }
+  if (height_it != args->end()) {
+    if (std::holds_alternative<int32_t>(height_it->second)) {
+      height = std::get<int32_t>(height_it->second);
+    } else if (std::holds_alternative<int64_t>(height_it->second)) {
+      height = static_cast<int>(std::get<int64_t>(height_it->second));
+    }
+  }
+
+  if (width <= 0 || height <= 0) {
+    result->Error("bad-args", "Invalid size");
+    return;
+  }
+  if (width == last_resize_width_ && height == last_resize_height_) {
+    result->Success();
+    return;
+  }
+
+  HWND hwnd = GetHandle();
+  if (!hwnd) {
+    result->Error("no-window", "Window not ready");
+    return;
+  }
+
+  const UINT dpi = GetDpiForWindow(hwnd);
+  RECT rect = {0, 0, width, height};
+  const DWORD style = static_cast<DWORD>(GetWindowLongPtr(hwnd, GWL_STYLE));
+  const DWORD ex_style = static_cast<DWORD>(GetWindowLongPtr(hwnd, GWL_EXSTYLE));
+  AdjustWindowRectExForDpi(&rect, style, FALSE, ex_style, dpi);
+  const int window_width = rect.right - rect.left;
+  const int window_height = rect.bottom - rect.top;
+
+  SetWindowPos(hwnd, nullptr, 0, 0, window_width, window_height,
+               SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+
+  last_resize_width_ = width;
+  last_resize_height_ = height;
+  result->Success();
 }
 
 void FlutterWindow::GetLastFrame(std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> result) {

@@ -110,6 +110,8 @@ class FlutterWindow : public Win32Window {
   void GetCaptureFrame(const flutter::MethodCall<flutter::EncodableValue>& call, std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> result);
   void GetLastFrame(std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> result);
   void GetTextureId(std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> result);
+  void ResizePreviewWindow(const flutter::MethodCall<flutter::EncodableValue>& call,
+                           std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> result);
 
   // Overlay
   void UpdateOverlay(const flutter::MethodCall<flutter::EncodableValue>& call,
@@ -130,6 +132,8 @@ class FlutterWindow : public Win32Window {
   UINT cached_client_height_ = 0;
   UINT cached_offset_x_ = 0;
   UINT cached_offset_y_ = 0;
+  int last_resize_width_ = 0;
+  int last_resize_height_ = 0;
 
   // Overlay Window
   std::unique_ptr<OverlayWindow> overlay_window_;
