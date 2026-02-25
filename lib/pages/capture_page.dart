@@ -1,16 +1,15 @@
 import 'dart:async';
 import 'dart:io';
 import 'dart:ui' as ui;
-import 'dart:ffi'; // Added
-import 'package:ffi/ffi.dart'; // Added
+import 'dart:ffi' hide Size;
+import 'package:ffi/ffi.dart';
 import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:win32/win32.dart' as win32;
 import '../controllers/input_controller.dart';
-import '../native/image_search.dart'; // Added
+import '../native/image_search.dart';
 
-// Missing constants in some win32 versions or specific libraries
 const int MK_LBUTTON = 0x0001;
 const int MK_RBUTTON = 0x0002;
 const int MK_SHIFT = 0x0004;
@@ -57,7 +56,7 @@ class _CapturePageState extends State<CapturePage> {
   List<ProcessEntry> _processList = [];
   ProcessEntry? _selectedProcess;
   bool _processLoading = false;
-  bool _isBusy = false; // Prevents re-entry during async ops
+  bool _isBusy = false;
   int _imageVersion = 0;
 
   Uint8List? _imageBytes;
@@ -79,13 +78,17 @@ class _CapturePageState extends State<CapturePage> {
   bool _controlEnabled = false;
   final FocusNode _inputFocusNode = FocusNode();
 
-  String? _lastInputStatus; // Store last input status for display
+  String? _lastInputStatus;
 
   // Search State
-  SearchResultStruct? _lastSearchResult;
-  final TextEditingController _templatePathController = TextEditingController();
-  // 用于显示 ROI 调试截图
   Uint8List? _debugRoiBytes;
+
+  // Auto Task State
+  bool _autoTaskEnabled = false;
+  Timer? _autoTaskTimer;
+  final Map<String, int> _taskTemplateIds = {};
+  final Map<int, Size> _taskTemplateSizes = {};
+  List<SearchResultStruct> _taskSearchResults = [];
 
   @override
   void initState() {
@@ -102,6 +105,7 @@ class _CapturePageState extends State<CapturePage> {
   void dispose() {
     _autoTimer?.cancel();
     _checkAliveTimer?.cancel();
+    _autoTaskTimer?.cancel();
     _inputFocusNode.dispose();
     super.dispose();
   }
@@ -110,14 +114,8 @@ class _CapturePageState extends State<CapturePage> {
     if (!_controlEnabled || _selectedProcess == null) return;
 
     final int pid = _selectedProcess!.pid;
-    // Coordinates relative to the image (InteractiveViewer child)
     final int x = event.localPosition.dx.toInt();
     final int y = event.localPosition.dy.toInt();
-
-    // Only update status for Down/Up to avoid spamming setState on Move
-    // For Move, update status every 10 events or so if needed, but for now just log/send
-    // Actually, user requested "监听到鼠标键盘动作时,在下方信息栏显示到的监听信息"
-    // To avoid lag, we might want to throttle UI updates, but send messages immediately.
 
     String action = '';
 
@@ -142,24 +140,13 @@ class _CapturePageState extends State<CapturePage> {
         );
       }
     } else if (event is PointerUpEvent) {
-      // For Up events, buttons might be 0, but we need to know which one was released.
-      // However, PointerUpEvent doesn't explicitly say which button released in a simple way
-      // other than checking changed buttons, but standard WM_LBUTTONUP doesn't need wParam usually (except keys).
-      // We can infer from the event type or check logic.
-      // Simply sending LBUTTONUP for primary button up is safe enough for now.
-      // A more robust way handles all buttons.
-      // For now, assume Left Button.
-      // Actually PointerUpEvent has 'kind'.
       action = 'Up';
       _inputController.sendMouseEvent(pid, x, y, win32.WM_LBUTTONUP, 0);
     } else if (event is PointerMoveEvent) {
-      // Throttle UI updates for move events to avoid performance hit
-      // But always send the message
       int wParam = 0;
       if (event.buttons & kPrimaryMouseButton != 0) wParam |= MK_LBUTTON;
       if (event.buttons & kSecondaryMouseButton != 0) wParam |= MK_RBUTTON;
       _inputController.sendMouseEvent(pid, x, y, win32.WM_MOUSEMOVE, wParam);
-      // action = 'Move'; // Don't update UI on every move
     } else if (event is PointerHoverEvent) {
       _inputController.sendMouseEvent(pid, x, y, win32.WM_MOUSEMOVE, 0);
     }
@@ -250,7 +237,6 @@ class _CapturePageState extends State<CapturePage> {
         }
       }
 
-      // If we have a selected process, check if it's still in the list
       final int? selectedPid = _selectedProcess?.pid;
       ProcessEntry? nextSelected;
       bool found = false;
@@ -266,20 +252,15 @@ class _CapturePageState extends State<CapturePage> {
       }
 
       if (!updateState && selectedPid != null && found) {
-        // Background check passed, process is alive.
-        // Do NOT update _selectedProcess to avoid icon flickering.
         return;
       }
 
       setState(() {
         _processList = processes;
-        // Check alive logic
         if (selectedPid != null) {
           if (found) {
-            // Update with latest info (e.g. CPU usage)
             _selectedProcess = nextSelected;
           } else {
-            // Process died
             _selectedProcess = null;
           }
         }
@@ -288,7 +269,6 @@ class _CapturePageState extends State<CapturePage> {
       if (!mounted) {
         return;
       }
-      // Only show error if explicitly refreshing
       if (updateState) {
         debugPrint('Refresh process list error: ${e.toString()}');
         setState(() {
@@ -400,7 +380,6 @@ class _CapturePageState extends State<CapturePage> {
         _autoEnabled = true;
       });
 
-      // Try to get texture ID for all modes as they all support it now
       try {
         final Map<Object?, Object?>? result = await _channel
             .invokeMapMethod<Object?, Object?>('getTextureId');
@@ -418,10 +397,8 @@ class _CapturePageState extends State<CapturePage> {
         }
       } catch (e) {
         debugPrint('Failed to get texture ID: $e');
-        // Fallback to manual loop if texture is not available
       }
 
-      // Start the loop without awaiting it, as it runs indefinitely until stopped
       _captureLoop();
     } on PlatformException catch (e) {
       if (!mounted) return;
@@ -441,8 +418,6 @@ class _CapturePageState extends State<CapturePage> {
   Future<void> _captureLoop() async {
     if (!_autoEnabled) return;
 
-    // 如果已经获取到纹理且尺寸有效，就不需要继续轮询了
-    // 除非我们想要监控尺寸变化（比如窗口缩放），这里假设只需要获取一次有效尺寸即可
     if (_textureId != null &&
         _textureWidth != null &&
         _textureWidth! > 0 &&
@@ -451,7 +426,6 @@ class _CapturePageState extends State<CapturePage> {
       return;
     }
 
-    // Retry getting texture ID instead of falling back to slow PNG capture
     try {
       final Map<Object?, Object?>? result = await _channel
           .invokeMapMethod<Object?, Object?>('getTextureId');
@@ -467,20 +441,16 @@ class _CapturePageState extends State<CapturePage> {
               _textureHeight = h?.toDouble();
             });
 
-            // 如果获取到的尺寸有效，就停止轮询
             if (w != null && w > 0 && h != null && h > 0) {
               return;
             }
           }
         }
       }
-    } catch (e) {
-      // debugPrint('Retry getTextureId failed: $e');
-    }
+    } catch (e) {}
 
     if (!mounted || !_autoEnabled) return;
 
-    // Wait before retrying (short interval for smoother startup)
     Future<void>.delayed(const Duration(milliseconds: 100), _captureLoop);
   }
 
@@ -491,7 +461,6 @@ class _CapturePageState extends State<CapturePage> {
     });
 
     try {
-      // Try to get one last frame before stopping
       if (_textureId != null) {
         try {
           final Uint8List? lastFrame = await _channel.invokeMethod(
@@ -502,9 +471,7 @@ class _CapturePageState extends State<CapturePage> {
               _imageBytes = lastFrame;
             });
           }
-        } catch (e) {
-          // Ignore last frame error
-        }
+        } catch (e) {}
       }
 
       await _channel.invokeMethod('stopCaptureSession');
@@ -521,7 +488,165 @@ class _CapturePageState extends State<CapturePage> {
     }
   }
 
-  // New import needed at top: import 'dart:io';
+  String _resolveResourcePath(String filename) {
+    final exeDir = File(Platform.resolvedExecutable).parent.path;
+    String path = '$exeDir\\yuanshen\\$filename';
+    if (!File(path).existsSync()) {
+      path = 'yuanshen/$filename';
+    }
+    return path;
+  }
+
+  Future<void> _startAutoTask() async {
+    if (_autoTaskEnabled) return;
+    final process = _selectedProcess;
+    if (process == null) {
+      setState(() => _errorMessage = '请先选择进程');
+      return;
+    }
+    setState(() => _errorMessage = null);
+
+    final templates = ['juqing.png', 'tiaoguo.png', 'f.png'];
+    _taskTemplateIds.clear();
+    _taskTemplateSizes.clear();
+
+    try {
+      for (final name in templates) {
+        final path = _resolveResourcePath(name);
+        if (!File(path).existsSync()) {
+          throw '资源文件缺失: $name\n路径: $path';
+        }
+
+        final bytes = await File(path).readAsBytes();
+        final codec = await ui.instantiateImageCodec(bytes);
+        final frame = await codec.getNextFrame();
+        final size = Size(
+          frame.image.width.toDouble(),
+          frame.image.height.toDouble(),
+        );
+        frame.image.dispose();
+
+        final id = NativeImageSearch().loadTemplate(path);
+        if (id <= 0) {
+          throw '加载模板失败: $name (ID: $id)';
+        }
+        _taskTemplateIds[name] = id;
+        _taskTemplateSizes[id] = size;
+      }
+    } catch (e) {
+      await _stopAutoTask();
+      setState(() => _errorMessage = e.toString());
+      return;
+    }
+
+    if (!_autoEnabled) {
+      await _startAutoCapture();
+    }
+
+    setState(() {
+      _autoTaskEnabled = true;
+    });
+
+    _autoTaskTimer = Timer.periodic(const Duration(milliseconds: 1000), (
+      timer,
+    ) {
+      _autoTaskLoop();
+    });
+  }
+
+  Future<void> _stopAutoTask() async {
+    _autoTaskTimer?.cancel();
+    _autoTaskTimer = null;
+
+    for (final id in _taskTemplateIds.values) {
+      NativeImageSearch().releaseTemplate(id);
+    }
+    _taskTemplateIds.clear();
+    _taskTemplateSizes.clear();
+
+    setState(() {
+      _autoTaskEnabled = false;
+      _taskSearchResults = [];
+    });
+  }
+
+  Future<void> _autoTaskLoop() async {
+    if (!_autoTaskEnabled || _selectedProcess == null) return;
+
+    try {
+      final Uint8List? imageBytes = await _channel.invokeMethod<Uint8List>(
+        'capture',
+        <String, Object?>{
+          'pid': _selectedProcess!.pid,
+          'processName': _selectedProcess!.name,
+        },
+      );
+
+      if (imageBytes == null || imageBytes.isEmpty) return;
+
+      final juqingId = _taskTemplateIds['juqing.png'];
+      final tiaoId = _taskTemplateIds['tiaoguo.png'];
+      final fId = _taskTemplateIds['f.png'];
+
+      if (juqingId == null) return;
+
+      final results = NativeImageSearch().findImagesBatch(imageBytes, [
+        SearchRequestStruct(juqingId, threshold: 0.8),
+      ]);
+
+      List<SearchResultStruct> currentResults = [];
+
+      // 检查是否找到剧情图片
+      bool foundJuqing = false;
+      for (final res in results) {
+        if (res.score >= 0.8) {
+          currentResults.add(res);
+          if (res.templateId == juqingId) {
+            foundJuqing = true;
+          }
+        }
+      }
+
+      if (foundJuqing) {
+        final subRequests = <SearchRequestStruct>[];
+        if (tiaoId != null) {
+          subRequests.add(SearchRequestStruct(tiaoId, threshold: 0.8));
+        }
+        if (fId != null) {
+          subRequests.add(SearchRequestStruct(fId, threshold: 0.8));
+        }
+
+        if (subRequests.isNotEmpty) {
+          final subResults = NativeImageSearch().findImagesBatch(
+            imageBytes,
+            subRequests,
+          );
+          
+          bool foundSub = false;
+          for (final res in subResults) {
+            if (res.score >= 0.8) {
+              currentResults.add(res);
+              foundSub = true;
+            }
+          }
+
+          if (foundSub) {
+            _inputController.sendKeyEvent(_selectedProcess!.pid, 0x46, true);
+            await Future.delayed(const Duration(milliseconds: 50));
+            _inputController.sendKeyEvent(_selectedProcess!.pid, 0x46, false);
+          }
+        }
+      }
+
+      if (mounted) {
+        setState(() {
+          _taskSearchResults = currentResults;
+        });
+      }
+    } catch (e) {
+      debugPrint('Auto task error: $e');
+    }
+  }
 
   Future<void> _showSearchDialog() async {
     final process = _selectedProcess;
@@ -530,22 +655,13 @@ class _CapturePageState extends State<CapturePage> {
       return;
     }
 
-    // 自动定位资源图片: yuanshen/juqing.png
-    // 优先级:
-    // 1. 相对于 exe 的路径 (发布模式)
-    // 2. 项目根目录 (调试模式)
-    // 3. 绝对路径 (Fallback)
-
     final exeDir = File(Platform.resolvedExecutable).parent.path;
     String imagePath = '$exeDir\\yuanshen\\juqing.png';
 
     if (!File(imagePath).existsSync()) {
-      // 调试模式下，exe 在 build/windows/runner/Debug，资源在项目根目录
-      // 尝试回退几层目录找 (简单起见，假设当前工作目录就是项目根目录)
       imagePath = 'yuanshen/juqing.png';
     }
 
-    // 如果还找不到，提示用户
     final bool fileExists = File(imagePath).existsSync();
 
     await showDialog(
@@ -598,11 +714,9 @@ class _CapturePageState extends State<CapturePage> {
             onPressed: !fileExists
                 ? null
                 : () async {
-                    // 1. 关闭当前对话框
                     Navigator.pop(context);
 
                     try {
-                      // 加载模板
                       final templateId = NativeImageSearch().loadTemplate(
                         imagePath,
                       );
@@ -614,7 +728,6 @@ class _CapturePageState extends State<CapturePage> {
                         return;
                       }
 
-                      // 2. 获取 WGC 截图 (关键修改：使用 Dart 层的 WGC，而不是 C++ GDI)
                       final stopwatchCapture = Stopwatch()..start();
                       final Uint8List? imageBytes = await _channel
                           .invokeMethod<Uint8List>('capture', <String, Object?>{
@@ -630,11 +743,8 @@ class _CapturePageState extends State<CapturePage> {
                         return;
                       }
 
-                      // 3. 执行查找 (使用 findImagesBatch)
                       final stopwatchSearch = Stopwatch()..start();
 
-                      // 构造请求：全图查找 (ROI = 0,0,-1,-1)
-                      // 注意：这里是在 imageBytes (WGC 截图) 内部查找，坐标系是相对于截图左上角的
                       final request = SearchRequestStruct(
                         templateId,
                         roiX: 0,
@@ -648,36 +758,27 @@ class _CapturePageState extends State<CapturePage> {
                         imageBytes,
                         [request],
                         width: 0,
-                        height: 0, // 0 表示自动识别 PNG/JPG
+                        height: 0,
                       );
                       stopwatchSearch.stop();
 
                       NativeImageSearch().releaseTemplate(templateId);
 
-                      // 读取调试截图
                       Uint8List? debugBytes;
                       final debugFile = File('debug_last_batch_source.png');
                       if (debugFile.existsSync()) {
                         debugBytes = await debugFile.readAsBytes();
                       }
 
-                      // 更新状态
                       setState(() {
                         _debugRoiBytes = debugBytes;
                         if (results.isNotEmpty && results[0].score >= 0.8) {
                           final res = results[0];
-                          _lastSearchResult = SearchResultStruct(
-                            templateId: res.templateId,
-                            x: res.x,
-                            y: res.y,
-                            score: res.score,
-                          ); // 适配旧 UI 可能需要调整类型，这里先简单处理
                           _errorMessage =
                               '✅ 找到目标! (${res.x}, ${res.y}) 置信度: ${res.score.toStringAsFixed(2)}\n'
                               '截图耗时: ${stopwatchCapture.elapsedMilliseconds}ms\n'
                               '查找耗时: ${stopwatchSearch.elapsedMilliseconds}ms';
                         } else {
-                          _lastSearchResult = null;
                           double maxScore = results.isNotEmpty
                               ? results[0].score
                               : 0.0;
@@ -688,7 +789,6 @@ class _CapturePageState extends State<CapturePage> {
                         }
                       });
 
-                      // 重新打开对话框，刷新显示
                       if (mounted) _showSearchDialog();
                     } catch (e) {
                       setState(() => _errorMessage = '搜索异常: $e');
@@ -704,7 +804,6 @@ class _CapturePageState extends State<CapturePage> {
 
   Widget _buildImagePreview() {
     Widget content;
-    // 严格检查纹理尺寸，防止传递 0 或 null 导致 TransformLayer 错误
     if (_textureId != null &&
         _textureWidth != null &&
         _textureWidth! > 0 &&
@@ -713,10 +812,22 @@ class _CapturePageState extends State<CapturePage> {
       content = SizedBox(
         width: _textureWidth,
         height: _textureHeight,
-        child: Texture(textureId: _textureId!),
+        child: Stack(
+          fit: StackFit.expand,
+          children: [
+            Texture(textureId: _textureId!),
+            if (_taskSearchResults.isNotEmpty)
+              CustomPaint(
+                painter: SearchResultPainter(
+                  _taskSearchResults,
+                  _taskTemplateSizes,
+                  _taskTemplateIds,
+                ),
+              ),
+          ],
+        ),
       );
     } else if (_textureId != null) {
-      // 有纹理 ID 但没有尺寸，说明正在初始化或等待第一帧
       return Container(
         alignment: Alignment.center,
         color: Colors.black12,
@@ -736,15 +847,28 @@ class _CapturePageState extends State<CapturePage> {
         child: const Text('暂无截图'),
       );
     } else {
-      content = Image.memory(
-        _imageBytes!,
-        key: ValueKey<int>(_imageVersion),
-        gaplessPlayback: true,
-        fit: BoxFit.none,
+      content = Stack(
+        children: [
+          Image.memory(
+            _imageBytes!,
+            key: ValueKey<int>(_imageVersion),
+            gaplessPlayback: true,
+            fit: BoxFit.none,
+          ),
+          if (_taskSearchResults.isNotEmpty)
+            Positioned.fill(
+              child: CustomPaint(
+                painter: SearchResultPainter(
+                  _taskSearchResults,
+                  _taskTemplateSizes,
+                  _taskTemplateIds,
+                ),
+              ),
+            ),
+        ],
       );
     }
 
-    // Wrap content with Listener for mouse events
     content = Listener(
       onPointerDown: _handlePointer,
       onPointerUp: _handlePointer,
@@ -769,12 +893,6 @@ class _CapturePageState extends State<CapturePage> {
   }
 
   Widget _buildProcessItem(ProcessEntry entry) {
-    // Keep this method but update it to match the dialog style or just ignore it if unused.
-    // Since the user wants the original dialog style, we will inline the style in the dialog
-    // and leave this method as is (or remove it if it causes issues, but better to just fix the dialog).
-    // Actually, to avoid the "unused" warning and keep code clean, let's make this method
-    // match the ORIGINAL dialog style exactly.
-
     final Widget icon = entry.iconBytes != null && entry.iconBytes!.isNotEmpty
         ? Image.memory(entry.iconBytes!, width: 32, height: 32)
         : const Icon(Icons.apps, size: 32);
@@ -850,9 +968,7 @@ class _CapturePageState extends State<CapturePage> {
                               final isSelected =
                                   _selectedProcess?.pid == entry.pid;
                               return InkWell(
-                                onTap: () {
-                                  // Optional: Single tap to highlight?
-                                },
+                                onTap: () {},
                                 onDoubleTap: () {
                                   this.setState(() {
                                     _selectedProcess = entry;
@@ -904,7 +1020,7 @@ class _CapturePageState extends State<CapturePage> {
         children: [
           Expanded(
             child: Text(
-              _lastInputStatus ?? statusText, // Prioritize input status
+              _lastInputStatus ?? statusText,
               style: const TextStyle(color: Colors.white, fontSize: 12),
             ),
           ),
@@ -931,7 +1047,6 @@ class _CapturePageState extends State<CapturePage> {
     return Scaffold(
       body: Column(
         children: [
-          // Toolbar
           Container(
             height: 50,
             padding: const EdgeInsets.symmetric(horizontal: 16),
@@ -1002,6 +1117,16 @@ class _CapturePageState extends State<CapturePage> {
                   tooltip: '图片查找测试',
                 ),
                 IconButton(
+                  icon: Icon(
+                    _autoTaskEnabled
+                        ? Icons.assignment_turned_in
+                        : Icons.assignment,
+                  ),
+                  color: _autoTaskEnabled ? Colors.blue : null,
+                  onPressed: _autoTaskEnabled ? _stopAutoTask : _startAutoTask,
+                  tooltip: _autoTaskEnabled ? '停止自动任务' : '开始自动任务',
+                ),
+                IconButton(
                   icon: Icon(_autoEnabled ? Icons.stop_circle : Icons.videocam),
                   color: _autoEnabled ? Colors.red : null,
                   onPressed: _isBusy
@@ -1013,7 +1138,6 @@ class _CapturePageState extends State<CapturePage> {
             ),
           ),
 
-          // Image Preview Area
           Expanded(
             child: Stack(
               children: [
@@ -1043,10 +1167,68 @@ class _CapturePageState extends State<CapturePage> {
             ),
           ),
 
-          // Status Bar
           _buildStatusBar(statusText),
         ],
       ),
     );
+  }
+}
+
+class SearchResultPainter extends CustomPainter {
+  final List<SearchResultStruct> results;
+  final Map<int, Size> templateSizes;
+  final Map<String, int> templateIds;
+
+  SearchResultPainter(this.results, this.templateSizes, this.templateIds);
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final paint = Paint()
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 3.0;
+
+    for (final res in results) {
+      if (res.templateId == templateIds['juqing.png']) {
+        paint.color = Colors.green;
+      } else {
+        paint.color = Colors.red;
+      }
+
+      final templateSize = templateSizes[res.templateId] ?? const Size(50, 50);
+
+      canvas.drawRect(
+        Rect.fromLTWH(
+          res.x.toDouble(),
+          res.y.toDouble(),
+          templateSize.width,
+          templateSize.height,
+        ),
+        paint,
+      );
+
+      final textSpan = TextSpan(
+        text: res.templateId == templateIds['juqing.png'] ? '剧情' : '交互',
+        style: TextStyle(
+          color: paint.color,
+          fontSize: 14,
+          fontWeight: FontWeight.bold,
+          backgroundColor: Colors.black54,
+        ),
+      );
+      final textPainter = TextPainter(
+        text: textSpan,
+        textDirection: TextDirection.ltr,
+      );
+      textPainter.layout();
+      textPainter.paint(
+        canvas,
+        Offset(res.x.toDouble(), res.y.toDouble() - 20),
+      );
+    }
+  }
+
+  @override
+  bool shouldRepaint(covariant SearchResultPainter oldDelegate) {
+    return oldDelegate.results != results;
   }
 }
