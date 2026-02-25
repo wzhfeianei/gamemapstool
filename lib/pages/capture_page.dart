@@ -90,6 +90,21 @@ class _CapturePageState extends State<CapturePage> {
   final Map<int, Size> _taskTemplateSizes = {};
   List<SearchResultStruct> _taskSearchResults = [];
 
+  // Auto Task Search ROI
+  int _searchRoiX = 0;
+  int _searchRoiY = 0;
+  int _searchRoiW = -1;
+  int _searchRoiH = -1;
+
+  void updateSearchRoi(int x, int y, int w, int h) {
+    setState(() {
+      _searchRoiX = x;
+      _searchRoiY = y;
+      _searchRoiW = w;
+      _searchRoiH = h;
+    });
+  }
+
   @override
   void initState() {
     super.initState();
@@ -593,7 +608,14 @@ class _CapturePageState extends State<CapturePage> {
       if (juqingId == null) return;
 
       final results = NativeImageSearch().findImagesBatch(imageBytes, [
-        SearchRequestStruct(juqingId, threshold: 0.8),
+        SearchRequestStruct(
+          juqingId,
+          threshold: 0.7,
+          roiX: 0,
+          roiY: 0,
+          roiW: 350,
+          roiH: 150,
+        ),
       ]);
 
       List<SearchResultStruct> currentResults = [];
@@ -601,7 +623,7 @@ class _CapturePageState extends State<CapturePage> {
       // 检查是否找到剧情图片
       bool foundJuqing = false;
       for (final res in results) {
-        if (res.score >= 0.8) {
+        if (res.score >= 0.7) {
           currentResults.add(res);
           if (res.templateId == juqingId) {
             foundJuqing = true;
@@ -612,10 +634,28 @@ class _CapturePageState extends State<CapturePage> {
       if (foundJuqing) {
         final subRequests = <SearchRequestStruct>[];
         if (tiaoId != null) {
-          subRequests.add(SearchRequestStruct(tiaoId, threshold: 0.8));
+          subRequests.add(
+            SearchRequestStruct(
+              tiaoId,
+              threshold: 0.7,
+              roiX: 900,
+              roiY: 1000,
+              roiW: 1100,
+              roiH: 1100,
+            ),
+          );
         }
         if (fId != null) {
-          subRequests.add(SearchRequestStruct(fId, threshold: 0.8));
+          subRequests.add(
+            SearchRequestStruct(
+              fId,
+              threshold: 0.7,
+              roiX: 1000,
+              roiY: 400,
+              roiW: 1500,
+              roiH: 1100,
+            ),
+          );
         }
 
         if (subRequests.isNotEmpty) {
@@ -626,7 +666,7 @@ class _CapturePageState extends State<CapturePage> {
 
           bool foundSub = false;
           for (final res in subResults) {
-            if (res.score >= 0.8) {
+            if (res.score >= 0.7) {
               currentResults.add(res);
               foundSub = true;
             }
@@ -1110,6 +1150,17 @@ class _CapturePageState extends State<CapturePage> {
                     ),
                   ),
                 ),
+                IconButton(
+                  icon: Icon(
+                    _autoTaskEnabled
+                        ? Icons.assignment_turned_in
+                        : Icons.assignment,
+                  ),
+                  color: _autoTaskEnabled ? Colors.blue : null,
+                  onPressed: _autoTaskEnabled ? _stopAutoTask : _startAutoTask,
+                  tooltip: _autoTaskEnabled ? '停止自动任务' : '开始自动任务',
+                ),
+
                 const Spacer(),
                 IconButton(
                   icon: Icon(
@@ -1138,16 +1189,7 @@ class _CapturePageState extends State<CapturePage> {
                   onPressed: _showSearchDialog,
                   tooltip: '图片查找测试',
                 ),
-                IconButton(
-                  icon: Icon(
-                    _autoTaskEnabled
-                        ? Icons.assignment_turned_in
-                        : Icons.assignment,
-                  ),
-                  color: _autoTaskEnabled ? Colors.blue : null,
-                  onPressed: _autoTaskEnabled ? _stopAutoTask : _startAutoTask,
-                  tooltip: _autoTaskEnabled ? '停止自动任务' : '开始自动任务',
-                ),
+
                 IconButton(
                   icon: Icon(_autoEnabled ? Icons.stop_circle : Icons.videocam),
                   color: _autoEnabled ? Colors.red : null,
