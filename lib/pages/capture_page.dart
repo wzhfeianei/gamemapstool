@@ -1,10 +1,14 @@
 import 'dart:async';
+import 'dart:io';
 import 'dart:ui' as ui;
+import 'dart:ffi'; // Added
+import 'package:ffi/ffi.dart'; // Added
 import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:win32/win32.dart' as win32;
 import '../controllers/input_controller.dart';
+import '../native/image_search.dart'; // Added
 
 // Missing constants in some win32 versions or specific libraries
 const int MK_LBUTTON = 0x0001;
@@ -77,6 +81,12 @@ class _CapturePageState extends State<CapturePage> {
 
   String? _lastInputStatus; // Store last input status for display
 
+  // Search State
+  SearchResult? _lastSearchResult;
+  final TextEditingController _templatePathController = TextEditingController();
+  // 用于显示 ROI 调试截图
+  Uint8List? _debugRoiBytes;
+  
   @override
   void initState() {
     super.initState();
@@ -498,6 +508,145 @@ class _CapturePageState extends State<CapturePage> {
     }
   }
 
+  // New import needed at top: import 'dart:io';
+
+  Future<void> _showSearchDialog() async {
+    final process = _selectedProcess;
+    if (process == null) {
+      setState(() => _errorMessage = '请先选择进程');
+      return;
+    }
+
+    // 自动定位资源图片: yuanshen/juqing.png
+    // 优先级: 
+    // 1. 相对于 exe 的路径 (发布模式)
+    // 2. 项目根目录 (调试模式)
+    // 3. 绝对路径 (Fallback)
+    
+    final exeDir = File(Platform.resolvedExecutable).parent.path;
+    String imagePath = '$exeDir\\yuanshen\\juqing.png';
+    
+    if (!File(imagePath).existsSync()) {
+      // 调试模式下，exe 在 build/windows/runner/Debug，资源在项目根目录
+      // 尝试回退几层目录找 (简单起见，假设当前工作目录就是项目根目录)
+      imagePath = 'yuanshen/juqing.png';
+    }
+    
+    // 如果还找不到，提示用户
+    final bool fileExists = File(imagePath).existsSync();
+
+    await showDialog(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('图片查找测试 (ROI)'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text('目标资源: yuanshen/juqing.png', style: const TextStyle(fontWeight: FontWeight.bold)),
+            const SizedBox(height: 4),
+            Text('实际路径: $imagePath', style: TextStyle(fontSize: 10, color: Colors.grey)),
+            Text('状态: ${fileExists ? "✅ 文件存在" : "❌ 文件不存在"}', 
+              style: TextStyle(color: fileExists ? Colors.green : Colors.red)),
+            const SizedBox(height: 12),
+            
+            if (_debugRoiBytes != null) ...[
+               const Text('上次查找的 ROI 区域截图:', style: TextStyle(fontWeight: FontWeight.bold)),
+               const SizedBox(height: 4),
+               Container(
+                 height: 150,
+                 width: double.infinity,
+                 decoration: BoxDecoration(border: Border.all(color: Colors.grey)),
+                 child: Image.memory(_debugRoiBytes!, fit: BoxFit.contain),
+               ),
+            ] else
+               const Text('暂无调试截图'),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('关闭'),
+          ),
+          ElevatedButton(
+            onPressed: !fileExists ? null : () async {
+              // 1. 关闭当前对话框
+              Navigator.pop(context);
+              
+              try {
+                // 加载模板
+                final templateId = NativeImageSearch().loadTemplate(imagePath);
+                if (templateId <= 0) {
+                  setState(() => _errorMessage = '加载模板失败 (ID: $templateId)');
+                  // 重新打开对话框显示结果
+                  _showSearchDialog();
+                  return;
+                }
+
+                // 获取窗口位置
+                final hwnd = _inputController.getHwndForPid(process.pid);
+                if (hwnd == 0) {
+                   setState(() => _errorMessage = '找不到窗口句柄');
+                   NativeImageSearch().releaseTemplate(templateId);
+                   _showSearchDialog();
+                   return;
+                }
+
+                final rectPtr = calloc<win32.RECT>();
+                win32.GetWindowRect(hwnd, rectPtr);
+                final x = rectPtr.ref.left;
+                final y = rectPtr.ref.top;
+                final w = rectPtr.ref.right - rectPtr.ref.left;
+                final h = rectPtr.ref.bottom - rectPtr.ref.top;
+                calloc.free(rectPtr);
+
+                // 执行查找
+                final stopwatch = Stopwatch()..start();
+                final result = NativeImageSearch().findImage(
+                  templateId, 
+                  x: x, y: y, w: w, h: h,
+                  threshold: 0.8
+                );
+                stopwatch.stop();
+                
+                NativeImageSearch().releaseTemplate(templateId);
+                
+                // 读取调试截图
+                Uint8List? debugBytes;
+                final debugFile = File('debug_last_roi.png');
+                if (debugFile.existsSync()) {
+                  // 添加时间戳防止缓存
+                  // 但 Image.memory 不需要，只要 bytes 变了就行
+                  debugBytes = await debugFile.readAsBytes();
+                }
+
+                // 更新状态
+                setState(() {
+                  _debugRoiBytes = debugBytes;
+                  if (result.score >= 0.8) {
+                    _lastSearchResult = result;
+                    _errorMessage = '✅ 找到目标! (${result.x}, ${result.y}) 置信度: ${result.score.toStringAsFixed(2)} 耗时: ${stopwatch.elapsedMilliseconds}ms';
+                  } else {
+                    _lastSearchResult = null;
+                    _errorMessage = '❌ 未找到目标 (最高分: ${result.score.toStringAsFixed(2)}) 耗时: ${stopwatch.elapsedMilliseconds}ms';
+                  }
+                });
+                
+                // 重新打开对话框，刷新显示
+                if (mounted) _showSearchDialog();
+
+              } catch (e) {
+                setState(() => _errorMessage = '搜索异常: $e');
+                if (mounted) _showSearchDialog();
+              }
+            },
+            child: const Text('查找'),
+          ),
+        ],
+      ),
+    );
+  }
+
   Widget _buildImagePreview() {
     Widget content;
     if (_textureId != null) {
@@ -778,6 +927,11 @@ class _CapturePageState extends State<CapturePage> {
                   icon: const Icon(Icons.camera_alt),
                   onPressed: _captureInProgress ? null : _captureOnce,
                   tooltip: '手动截图',
+                ),
+                IconButton(
+                  icon: const Icon(Icons.image_search),
+                  onPressed: _showSearchDialog,
+                  tooltip: '图片查找测试',
                 ),
                 IconButton(
                   icon: Icon(_autoEnabled ? Icons.stop_circle : Icons.videocam),
