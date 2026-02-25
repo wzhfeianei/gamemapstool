@@ -42,23 +42,8 @@ add_dependencies(${BINARY_NAME} flutter_assemble)
 
 # === OpenCV DLL Auto Copy ===
 # 自动查找并复制 OpenCV DLL 到输出目录
-# 根据构建类型 (Debug/Release) 选择正确的 DLL，减少包体积
-if(CMAKE_BUILD_TYPE MATCHES "Debug")
-    # Debug 模式：优先查找带 'd' 后缀的 DLL
-    file(GLOB OpenCV_DLLS "C:/Users/Administrator/scoop/apps/opencv/current/x64/vc16/bin/opencv_world*d.dll")
-else()
-    # Release/Profile 模式：只保留 release DLL (排除 *d.dll)
-    # 策略：先找出所有的 DLL，然后剔除掉以 d.dll 结尾的
-    file(GLOB ALL_DLLS "C:/Users/Administrator/scoop/apps/opencv/current/x64/vc16/bin/opencv_world*.dll")
-    set(OpenCV_DLLS "")
-    foreach(DLL_PATH ${ALL_DLLS})
-        # 简单字符串匹配：如果文件名不以 "d.dll" 结尾，则认为是 Release 版
-        string(REGEX MATCH "d\\.dll$" IS_DEBUG "${DLL_PATH}")
-        if(NOT IS_DEBUG)
-            list(APPEND OpenCV_DLLS ${DLL_PATH})
-        endif()
-    endforeach()
-endif()
+# 为了防止 Release/Debug 混用导致找不到 DLL，这里复制所有 DLL
+file(GLOB OpenCV_DLLS "C:/Users/Administrator/scoop/apps/opencv/current/x64/vc16/bin/opencv_world*.dll")
 
 if(OpenCV_DLLS)
     message(STATUS "Found OpenCV DLLs for Runner (${CMAKE_BUILD_TYPE}): ${OpenCV_DLLS}")

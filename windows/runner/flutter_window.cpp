@@ -710,7 +710,7 @@ HWND FindBestWindowForPids(const std::set<DWORD>& pids) {
   return context.best;
 }
 
-bool CaptureWindowToPngBytesWgc(HWND hwnd, std::vector<uint8_t>* output,
+bool CaptureWindowToBmpBytesWgc(HWND hwnd, std::vector<uint8_t>* output,
                                 std::wstring* error) {
   if (!winrt::Windows::Graphics::Capture::GraphicsCaptureSession::IsSupported()) {
     if (error) {
@@ -950,50 +950,52 @@ bool CaptureWindowToPngBytesWgc(HWND hwnd, std::vector<uint8_t>* output,
     }
     return false;
   }
-  HRESULT com_init = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
-  ComPtr<IWICImagingFactory> factory;
-  hr = CoCreateInstance(CLSID_WICImagingFactory, nullptr,
-                        CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&factory));
-  if (FAILED(hr)) {
-    d3d_context->Unmap(staging.Get(), 0);
-    if (error) {
-      *error = L"Failed to init encoder";
-    }
-    if (SUCCEEDED(com_init)) {
-      CoUninitialize();
-    }
-    if (apartment_inited) {
-      winrt::uninit_apartment();
-    }
-    return false;
+  int width = staging_desc.Width;
+  int height = staging_desc.Height;
+  int stride = width * 4;
+  int imageSize = stride * height;
+
+  output->resize(sizeof(BITMAPFILEHEADER) + sizeof(BITMAPINFOHEADER) + imageSize);
+  uint8_t* dst_buffer = output->data();
+
+  BITMAPFILEHEADER* bmfh = (BITMAPFILEHEADER*)dst_buffer;
+  BITMAPINFOHEADER* bmih = (BITMAPINFOHEADER*)(dst_buffer + sizeof(BITMAPFILEHEADER));
+
+  bmfh->bfType = 0x4D42; // "BM"
+  bmfh->bfSize = static_cast<DWORD>(output->size());
+  bmfh->bfReserved1 = 0;
+  bmfh->bfReserved2 = 0;
+  bmfh->bfOffBits = sizeof(BITMAPFILEHEADER) + sizeof(BITMAPINFOHEADER);
+
+  bmih->biSize = sizeof(BITMAPINFOHEADER);
+  bmih->biWidth = width;
+  bmih->biHeight = -height; // Top-down
+  bmih->biPlanes = 1;
+  bmih->biBitCount = 32;
+  bmih->biCompression = BI_RGB;
+  bmih->biSizeImage = imageSize;
+  bmih->biXPelsPerMeter = 0;
+  bmih->biYPelsPerMeter = 0;
+  bmih->biClrUsed = 0;
+  bmih->biClrImportant = 0;
+
+  uint8_t* pixels = dst_buffer + bmfh->bfOffBits;
+  const uint8_t* src = (const uint8_t*)mapped.pData;
+
+  if (mapped.RowPitch == static_cast<UINT>(stride)) {
+      memcpy(pixels, src, imageSize);
+  } else {
+      for (int y = 0; y < height; ++y) {
+          memcpy(pixels + y * stride, src + y * mapped.RowPitch, stride);
+      }
   }
-  ComPtr<IWICBitmap> wic_bitmap;
-  hr = factory->CreateBitmapFromMemory(
-      staging_desc.Width, staging_desc.Height, GUID_WICPixelFormat32bppBGRA,
-      mapped.RowPitch, static_cast<UINT>(buffer_size),
-      static_cast<BYTE*>(mapped.pData), &wic_bitmap);
+
   d3d_context->Unmap(staging.Get(), 0);
-  if (FAILED(hr)) {
-    if (error) {
-      *error = L"Failed to convert capture bitmap";
-    }
-    if (SUCCEEDED(com_init)) {
-      CoUninitialize();
-    }
-    if (apartment_inited) {
-      winrt::uninit_apartment();
-    }
-    return false;
-  }
-  const bool ok =
-      EncodeWicBitmapToPng(factory.Get(), wic_bitmap.Get(), output, error);
-  if (SUCCEEDED(com_init)) {
-    CoUninitialize();
-  }
+
   if (apartment_inited) {
     winrt::uninit_apartment();
   }
-  return ok;
+  return true;
 }
 }  
 
@@ -1145,16 +1147,16 @@ bool FlutterWindow::OnCreate() {
           result->Error("not-found", "Target window not found");
           return;
         }
-        std::vector<uint8_t> png_bytes;
+        std::vector<uint8_t> bmp_bytes;
         std::wstring error;
-        bool captured = CaptureWindowToPngBytesWgc(hwnd, &png_bytes, &error);
+        bool captured = CaptureWindowToBmpBytesWgc(hwnd, &bmp_bytes, &error);
         
         if (!captured) {
           result->Error("capture-failed",
                         error.empty() ? "Capture failed" : WideToUtf8(error));
           return;
         }
-        result->Success(flutter::EncodableValue(png_bytes));
+        result->Success(flutter::EncodableValue(bmp_bytes));
       });
   SetChildContent(flutter_controller_->view()->GetNativeWindow());
 
@@ -1445,11 +1447,11 @@ void FlutterWindow::GetCaptureFrame(const flutter::MethodCall<flutter::Encodable
       return;
   }
 
-  std::vector<uint8_t> png_bytes;
+  std::vector<uint8_t> bmp_bytes;
   std::wstring error;
   // Try WGC capture first
-  if (CaptureWindowToPngBytesWgc(hwnd, &png_bytes, &error)) {
-      result->Success(flutter::EncodableValue(png_bytes));
+  if (CaptureWindowToBmpBytesWgc(hwnd, &bmp_bytes, &error)) {
+      result->Success(flutter::EncodableValue(bmp_bytes));
       return;
   }
   

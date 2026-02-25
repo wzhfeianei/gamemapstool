@@ -178,6 +178,27 @@ extern "C" {
             // matchTemplate 需要 BGR 或灰度，通常不需要 Alpha
             // 转换为 BGR
             cv::cvtColor(sourceImage, sourceImage, cv::COLOR_BGRA2BGR);
+        } else if (length > 54 && imageBytes[0] == 'B' && imageBytes[1] == 'M') {
+            // BMP Optimization (Zero-Copy Load)
+            BITMAPFILEHEADER* bmfh = (BITMAPFILEHEADER*)imageBytes;
+            BITMAPINFOHEADER* bmih = (BITMAPINFOHEADER*)(imageBytes + sizeof(BITMAPFILEHEADER));
+            
+            // Only optimize for 32bpp Top-Down BGRA (which our WGC capture produces)
+            if (bmih->biBitCount == 32 && bmih->biCompression == BI_RGB && bmih->biHeight < 0) {
+                int w = bmih->biWidth;
+                int h = -bmih->biHeight; // Absolute height
+                uint8_t* pixels = imageBytes + bmfh->bfOffBits;
+                
+                // Construct Mat pointing to existing memory
+                sourceImage = cv::Mat(h, w, CV_8UC4, pixels);
+                
+                // Convert to BGR for matching (Allocate new Mat)
+                cv::cvtColor(sourceImage, sourceImage, cv::COLOR_BGRA2BGR);
+            } else {
+                // Fallback for other BMP formats
+                std::vector<uint8_t> buffer(imageBytes, imageBytes + length);
+                sourceImage = cv::imdecode(buffer, cv::IMREAD_COLOR);
+            }
         } else {
             // 压缩图片模式 (PNG/JPG)
             // 先将数据包装成 vector 或 Mat

@@ -25,25 +25,44 @@ typedef ReleaseTemplateDart = void Function(int id);
 typedef ReleaseAllTemplatesC = Void Function();
 typedef ReleaseAllTemplatesDart = void Function();
 
-typedef FindImageC = SearchResult Function(
-    Int32 id, Int32 x, Int32 y, Int32 w, Int32 h, Double threshold);
-typedef FindImageDart = SearchResult Function(
-    int id, int x, int y, int w, int h, double threshold);
+typedef FindImageC =
+    SearchResult Function(
+      Int32 id,
+      Int32 x,
+      Int32 y,
+      Int32 w,
+      Int32 h,
+      Double threshold,
+    );
+typedef FindImageDart =
+    SearchResult Function(int id, int x, int y, int w, int h, double threshold);
 
 typedef DebugSaveLastCaptureC = Void Function(Pointer<Utf8> path);
 typedef DebugSaveLastCaptureDart = void Function(Pointer<Utf8> path);
 
 // 批量查找接口定义
-typedef FindImagesBatchC = Void Function(
-    Pointer<Uint8> imageBytes, Int32 length,
-    Int32 width, Int32 height, Int32 stride,
-    Pointer<SearchRequest> requests, Int32 count,
-    Pointer<SearchResultItem> results);
-typedef FindImagesBatchDart = void Function(
-    Pointer<Uint8> imageBytes, int length,
-    int width, int height, int stride,
-    Pointer<SearchRequest> requests, int count,
-    Pointer<SearchResultItem> results);
+typedef FindImagesBatchC =
+    Void Function(
+      Pointer<Uint8> imageBytes,
+      Int32 length,
+      Int32 width,
+      Int32 height,
+      Int32 stride,
+      Pointer<SearchRequest> requests,
+      Int32 count,
+      Pointer<SearchResultItem> results,
+    );
+typedef FindImagesBatchDart =
+    void Function(
+      Pointer<Uint8> imageBytes,
+      int length,
+      int width,
+      int height,
+      int stride,
+      Pointer<SearchRequest> requests,
+      int count,
+      Pointer<SearchResultItem> results,
+    );
 
 class NativeImageSearch {
   static NativeImageSearch? _instance;
@@ -67,25 +86,55 @@ class NativeImageSearch {
     // 在 Release 模式下，DLL 与 exe 同级
     try {
       if (Platform.isWindows) {
-        _lib = DynamicLibrary.open('native_image_search.dll');
+        // 尝试预加载 OpenCV DLL 以解决依赖问题
+        try {
+          // 尝试加载 Release 版
+          DynamicLibrary.open('opencv_world4120.dll');
+        } catch (_) {
+          try {
+            // 尝试加载 Debug 版
+            DynamicLibrary.open('opencv_world4120d.dll');
+          } catch (e) {
+            print('Warning: Failed to pre-load OpenCV DLL: $e');
+          }
+        }
+
+        try {
+          _lib = DynamicLibrary.open('native_image_search.dll');
+        } catch (e) {
+          print('Failed to load native_image_search.dll from default path: $e');
+          // 尝试使用绝对路径加载 (相对于可执行文件)
+          final exePath = Platform.resolvedExecutable;
+          final dir = File(exePath).parent.path;
+          final dllPath = '$dir\\native_image_search.dll';
+          print('Trying to load DLL from absolute path: $dllPath');
+          _lib = DynamicLibrary.open(dllPath);
+        }
       } else {
         throw UnsupportedError('This plugin only supports Windows');
       }
 
       // 绑定函数
-      _loadTemplate = _lib
-          .lookupFunction<LoadTemplateC, LoadTemplateDart>('load_template');
+      _loadTemplate = _lib.lookupFunction<LoadTemplateC, LoadTemplateDart>(
+        'load_template',
+      );
       _releaseTemplate = _lib
-          .lookupFunction<ReleaseTemplateC, ReleaseTemplateDart>('release_template');
+          .lookupFunction<ReleaseTemplateC, ReleaseTemplateDart>(
+            'release_template',
+          );
       _releaseAllTemplates = _lib
-          .lookupFunction<ReleaseAllTemplatesC, ReleaseAllTemplatesDart>('release_all_templates');
-      _findImage = _lib
-          .lookupFunction<FindImageC, FindImageDart>('find_image');
+          .lookupFunction<ReleaseAllTemplatesC, ReleaseAllTemplatesDart>(
+            'release_all_templates',
+          );
+      _findImage = _lib.lookupFunction<FindImageC, FindImageDart>('find_image');
       _debugSaveLastCapture = _lib
-          .lookupFunction<DebugSaveLastCaptureC, DebugSaveLastCaptureDart>('debug_save_last_capture');
+          .lookupFunction<DebugSaveLastCaptureC, DebugSaveLastCaptureDart>(
+            'debug_save_last_capture',
+          );
       _findImagesBatch = _lib
-          .lookupFunction<FindImagesBatchC, FindImagesBatchDart>('find_images_batch');
-          
+          .lookupFunction<FindImagesBatchC, FindImagesBatchDart>(
+            'find_images_batch',
+          );
     } catch (e) {
       print('Failed to load native_image_search.dll: $e');
       // 可以选择抛出异常或降级处理
@@ -119,11 +168,17 @@ class NativeImageSearch {
   /// 如果 [w] 或 [h] <= 0，则查找全屏
   /// [threshold] 匹配阈值 (0.0 - 1.0)
   /// 返回 SearchResultResult (x, y, score)
-  SearchResult findImage(int templateId,
-      {int x = 0, int y = 0, int w = -1, int h = -1, double threshold = 0.9}) {
+  SearchResult findImage(
+    int templateId, {
+    int x = 0,
+    int y = 0,
+    int w = -1,
+    int h = -1,
+    double threshold = 0.9,
+  }) {
     return _findImage(templateId, x, y, w, h, threshold);
   }
-  
+
   /// 调试：保存最后一次截图
   void debugSaveLastCapture(String path) {
     final pathPtr = path.toNativeUtf8();
@@ -140,10 +195,11 @@ class NativeImageSearch {
   /// [requests] 任务列表
   /// 返回: 结果列表 (与 requests 一一对应)
   List<SearchResultStruct> findImagesBatch(
-    Uint8List imageBytes, 
-    List<SearchRequestStruct> requests,
-    {int width = 0, int height = 0}
-  ) {
+    Uint8List imageBytes,
+    List<SearchRequestStruct> requests, {
+    int width = 0,
+    int height = 0,
+  }) {
     if (requests.isEmpty) return [];
 
     final int count = requests.length;
@@ -169,10 +225,14 @@ class NativeImageSearch {
 
     try {
       _findImagesBatch(
-        imgPtr, imageBytes.length, 
-        width, height, stride, 
-        reqPtr, count, 
-        resPtr
+        imgPtr,
+        imageBytes.length,
+        width,
+        height,
+        stride,
+        reqPtr,
+        count,
+        resPtr,
       );
 
       return List.generate(count, (i) {
@@ -181,10 +241,9 @@ class NativeImageSearch {
           templateId: item.templateId,
           x: item.x,
           y: item.y,
-          score: item.score
+          score: item.score,
         );
       });
-
     } finally {
       calloc.free(imgPtr);
       calloc.free(reqPtr);
@@ -201,10 +260,10 @@ class SearchResultStruct {
   final double score;
 
   SearchResultStruct({
-    required this.templateId, 
-    required this.x, 
-    required this.y, 
-    required this.score
+    required this.templateId,
+    required this.x,
+    required this.y,
+    required this.score,
   });
 }
 
@@ -213,28 +272,43 @@ class SearchRequestStruct {
   final int roiX, roiY, roiW, roiH;
   final double threshold;
 
-  SearchRequestStruct(this.templateId, {
-    this.roiX = 0, this.roiY = 0, this.roiW = -1, this.roiH = -1, 
-    this.threshold = 0.9
+  SearchRequestStruct(
+    this.templateId, {
+    this.roiX = 0,
+    this.roiY = 0,
+    this.roiW = -1,
+    this.roiH = -1,
+    this.threshold = 0.9,
   });
 }
 
 // FFI 结构体定义 (与 C++ 对应)
 base class SearchRequest extends Struct {
-  @Int32() external int templateId;
-  @Int32() external int roiX;
-  @Int32() external int roiY;
-  @Int32() external int roiW;
-  @Int32() external int roiH;
-  @Double() external double threshold;
+  @Int32()
+  external int templateId;
+  @Int32()
+  external int roiX;
+  @Int32()
+  external int roiY;
+  @Int32()
+  external int roiW;
+  @Int32()
+  external int roiH;
+  @Double()
+  external double threshold;
 }
 
 base class SearchResultItem extends Struct {
-  @Int32() external int templateId;
-  @Int32() external int x;
-  @Int32() external int y;
-  @Double() external double score;
+  @Int32()
+  external int templateId;
+  @Int32()
+  external int x;
+  @Int32()
+  external int y;
+  @Double()
+  external double score;
 }
+
 class ImageTemplate {
   final int id;
   final String path;
@@ -250,15 +324,22 @@ class ImageTemplate {
 
   /// 在指定区域查找
   SearchResult? find({
-    int x = 0, 
-    int y = 0, 
-    int w = -1, 
-    int h = -1, 
-    double threshold = 0.9
+    int x = 0,
+    int y = 0,
+    int w = -1,
+    int h = -1,
+    double threshold = 0.9,
   }) {
     if (_disposed) throw StateError('Template already disposed');
-    
-    final result = NativeImageSearch().findImage(id, x: x, y: y, w: w, h: h, threshold: threshold);
+
+    final result = NativeImageSearch().findImage(
+      id,
+      x: x,
+      y: y,
+      w: w,
+      h: h,
+      threshold: threshold,
+    );
     if (result.score >= threshold) {
       return result;
     }

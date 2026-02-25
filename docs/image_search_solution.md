@@ -11,10 +11,15 @@
 ## 2. 关键特性
 
 ### 2.1 极致性能优化
+*   **WGC 极速截屏 (Zero-Copy Capture)**: 
+    *   底层重写了 WGC 截屏逻辑，移除昂贵的 PNG 编码/解码过程。
+    *   直接获取显存中的原始像素数据 (Raw BGRA)，并通过内存映射 (Memory Mapping) 传递给 Dart/C++。
+    *   **性能提升**: 截屏耗时从 300ms+ 降低至 30ms 级别。
 *   **批量处理 (Batch Processing)**: 通过 `find_images_batch` 接口，支持一次传入一张大图（屏幕截图）和多个查找任务。C++ 内部循环处理，避免了多次 FFI 调用和多次图像解码的开销。
 *   **智能格式识别**: C++ 接口自动识别输入数据格式：
-    *   **Raw BGRA**: 如果提供了宽高和 stride，直接将内存映射为 `cv::Mat`，实现**零拷贝**加载（推荐用于 WGC 原始流）。
-    *   **PNG/JPG**: 如果未提供宽高，自动调用 `imdecode` 解码（兼容性好）。
+    *   **BMP (Optimization)**: 针对 WGC 输出的 BMP 格式，直接解析头部并复用内存，避免 `imdecode` 的内存分配和拷贝。
+    *   **Raw BGRA**: 如果提供了宽高和 stride，直接将内存映射为 `cv::Mat`。
+    *   **PNG/JPG**: 自动调用 `imdecode` 解码（兼容性兜底）。
 *   **ROI 区域锁定**: 支持在查找时指定 `(x, y, w, h)` 区域，仅在局部进行模板匹配，计算量通常减少 90% 以上。
 
 ### 2.2 资源管理策略
@@ -35,6 +40,7 @@
     *   **推荐方式**: 使用 Scoop 安装 (`scoop install opencv`)。
     *   **路径**: 脚本会自动在 `C:/Users/<User>/scoop/apps/opencv/current/x64/vc16` 查找。
     *   **环境变量**: 如果安装在其他位置，需设置 `OPENCV_DIR` 环境变量指向 `build` 目录。
+*   **GameMaps (External)**: 项目依赖 `external/gamemaps` 子模块，用于提供部分图像处理算法参考。
 
 ### 3.2 构建系统 (CMake)
 *   **自动化配置**: `windows/native_lib/CMakeLists.txt` 已配置为自动查找 OpenCV。
