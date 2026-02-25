@@ -9,6 +9,7 @@ import 'package:flutter/services.dart';
 import 'package:win32/win32.dart' as win32;
 import '../controllers/input_controller.dart';
 import '../native/image_search.dart';
+import '../native/image_search_worker.dart';
 
 const int MK_LBUTTON = 0x0001;
 const int MK_RBUTTON = 0x0002;
@@ -96,6 +97,8 @@ class _CapturePageState extends State<CapturePage> {
   int _searchRoiW = -1;
   int _searchRoiH = -1;
 
+  final ImageSearchWorker _imageWorker = ImageSearchWorker();
+
   void updateSearchRoi(int x, int y, int w, int h) {
     setState(() {
       _searchRoiX = x;
@@ -108,6 +111,7 @@ class _CapturePageState extends State<CapturePage> {
   @override
   void initState() {
     super.initState();
+    _imageWorker.init();
     _refreshProcessList();
     _checkAliveTimer = Timer.periodic(const Duration(seconds: 3), (timer) {
       if (_selectedProcess != null) {
@@ -118,6 +122,7 @@ class _CapturePageState extends State<CapturePage> {
 
   @override
   void dispose() {
+    _imageWorker.dispose();
     _autoTimer?.cancel();
     _checkAliveTimer?.cancel();
     _autoTaskTimer?.cancel();
@@ -541,7 +546,7 @@ class _CapturePageState extends State<CapturePage> {
         );
         frame.image.dispose();
 
-        final id = NativeImageSearch().loadTemplate(path);
+        final id = await _imageWorker.loadTemplate(path);
         if (id <= 0) {
           throw '加载模板失败: $name (ID: $id)';
         }
@@ -580,7 +585,7 @@ class _CapturePageState extends State<CapturePage> {
     }
 
     for (final id in _taskTemplateIds.values) {
-      NativeImageSearch().releaseTemplate(id);
+      await _imageWorker.releaseTemplate(id);
     }
     _taskTemplateIds.clear();
     _taskTemplateSizes.clear();
@@ -607,14 +612,14 @@ class _CapturePageState extends State<CapturePage> {
 
       if (juqingId == null) return;
 
-      final results = NativeImageSearch().findImagesBatch(imageBytes, [
+      final results = await _imageWorker.findImagesBatch(imageBytes, [
         SearchRequestStruct(
           juqingId,
           threshold: 0.7,
-          roiX: 0,
-          roiY: 0,
-          roiW: 350,
-          roiH: 150,
+          roiX: _searchRoiX,
+          roiY: _searchRoiY,
+          roiW: _searchRoiW,
+          roiH: _searchRoiH,
         ),
       ]);
 
@@ -637,7 +642,7 @@ class _CapturePageState extends State<CapturePage> {
           subRequests.add(
             SearchRequestStruct(
               tiaoId,
-              threshold: 0.7,
+              threshold: 0.5,
               roiX: 900,
               roiY: 1000,
               roiW: 1100,
@@ -659,7 +664,7 @@ class _CapturePageState extends State<CapturePage> {
         }
 
         if (subRequests.isNotEmpty) {
-          final subResults = NativeImageSearch().findImagesBatch(
+          final subResults = await _imageWorker.findImagesBatch(
             imageBytes,
             subRequests,
           );
@@ -694,11 +699,11 @@ class _CapturePageState extends State<CapturePage> {
         }
       }
 
-      try {
-        await _channel.invokeMethod('updateOverlay', {'rects': overlayRects});
-      } catch (e) {
-        debugPrint('Update overlay error: $e');
-      }
+      // try {
+      //   await _channel.invokeMethod('updateOverlay', {'rects': overlayRects});
+      // } catch (e) {
+      //   debugPrint('Update overlay error: $e');
+      // }
 
       if (mounted) {
         setState(() {
@@ -779,7 +784,7 @@ class _CapturePageState extends State<CapturePage> {
                     Navigator.pop(context);
 
                     try {
-                      final templateId = NativeImageSearch().loadTemplate(
+                      final templateId = await _imageWorker.loadTemplate(
                         imagePath,
                       );
                       if (templateId <= 0) {
@@ -800,7 +805,7 @@ class _CapturePageState extends State<CapturePage> {
 
                       if (imageBytes == null || imageBytes.isEmpty) {
                         setState(() => _errorMessage = 'WGC 截图失败或返回为空');
-                        NativeImageSearch().releaseTemplate(templateId);
+                        await _imageWorker.releaseTemplate(templateId);
                         _showSearchDialog();
                         return;
                       }
@@ -816,7 +821,7 @@ class _CapturePageState extends State<CapturePage> {
                         threshold: 0.8,
                       );
 
-                      final results = NativeImageSearch().findImagesBatch(
+                      final results = await _imageWorker.findImagesBatch(
                         imageBytes,
                         [request],
                         width: 0,
@@ -824,7 +829,7 @@ class _CapturePageState extends State<CapturePage> {
                       );
                       stopwatchSearch.stop();
 
-                      NativeImageSearch().releaseTemplate(templateId);
+                      await _imageWorker.releaseTemplate(templateId);
 
                       Uint8List? debugBytes;
                       final debugFile = File('debug_last_batch_source.png');
